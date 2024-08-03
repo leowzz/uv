@@ -371,14 +371,16 @@ pub enum PipCommand {
     Sync(Box<PipSyncArgs>),
     /// Install packages into an environment.
     #[command(
+        alias = "i",
         after_help = "Use `uv help pip install` for more details.",
-        after_long_help = ""
+        after_long_help = "",
     )]
     Install(PipInstallArgs),
     /// Uninstall packages from an environment.
     #[command(
+        alias = "u",
         after_help = "Use `uv help pip uninstall` for more details.",
-        after_long_help = ""
+        after_long_help = "",
     )]
     Uninstall(PipUninstallArgs),
     /// List, in requirements format, packages installed in an environment.
