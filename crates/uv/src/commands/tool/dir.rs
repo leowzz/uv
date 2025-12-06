@@ -1,25 +1,31 @@
-use anstream::println;
+use std::fmt::Write;
+
 use anyhow::Context;
 use owo_colors::OwoColorize;
 
-use uv_configuration::PreviewMode;
 use uv_fs::Simplified;
-use uv_tool::{find_executable_directory, InstalledTools};
-use uv_warnings::warn_user_once;
+use uv_preview::Preview;
+use uv_tool::{InstalledTools, tool_executable_dir};
+
+use crate::printer::Printer;
 
 /// Show the tool directory.
-pub(crate) fn dir(bin: bool, preview: PreviewMode) -> anyhow::Result<()> {
-    if preview.is_disabled() {
-        warn_user_once!("`uv tool dir` is experimental and may change without warning");
-    }
-
+pub(crate) fn dir(bin: bool, _preview: Preview, printer: Printer) -> anyhow::Result<()> {
     if bin {
-        let executable_directory = find_executable_directory()?;
-        println!("{}", executable_directory.simplified_display().cyan());
+        let executable_directory = tool_executable_dir()?;
+        writeln!(
+            printer.stdout(),
+            "{}",
+            executable_directory.simplified_display().cyan()
+        )?;
     } else {
         let installed_tools =
             InstalledTools::from_settings().context("Failed to initialize tools settings")?;
-        println!("{}", installed_tools.root().simplified_display().cyan());
+        writeln!(
+            printer.stdout(),
+            "{}",
+            installed_tools.root().simplified_display().cyan()
+        )?;
     }
 
     Ok(())

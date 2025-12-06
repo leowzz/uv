@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Args, ValueEnum};
 
 use uv_warnings::warn_user;
@@ -13,7 +13,6 @@ pub trait CompatArgs {
 /// For example, users often pass `--allow-unsafe`, which is unnecessary with uv. But it's a
 /// nice user experience to warn, rather than fail, when users pass `--allow-unsafe`.
 #[derive(Args)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct PipCompileCompatArgs {
     #[clap(long, hide = true)]
     allow_unsafe: bool,
@@ -38,9 +37,6 @@ pub struct PipCompileCompatArgs {
 
     #[clap(long, hide = true)]
     client_cert: Option<String>,
-
-    #[clap(long, hide = true)]
-    trusted_host: Option<String>,
 
     #[clap(long, hide = true)]
     emit_trusted_host: bool,
@@ -78,7 +74,9 @@ impl CompatArgs for PipCompileCompatArgs {
         }
 
         if self.no_allow_unsafe {
-            warn_user!("pip-compile's `--no-allow-unsafe` has no effect (uv can safely pin `pip` and other packages)");
+            warn_user!(
+                "pip-compile's `--no-allow-unsafe` has no effect (uv can safely pin `pip` and other packages)"
+            );
         }
 
         if self.reuse_hashes {
@@ -118,15 +116,9 @@ impl CompatArgs for PipCompileCompatArgs {
             ));
         }
 
-        if self.trusted_host.is_some() {
-            return Err(anyhow!(
-                "pip-compile's `--trusted-host` is unsupported (uv always requires HTTPS)"
-            ));
-        }
-
         if self.emit_trusted_host {
             return Err(anyhow!(
-                "pip-compile's `--emit-trusted-host` is unsupported (uv always requires HTTPS)"
+                "pip-compile's `--emit-trusted-host` is unsupported"
             ));
         }
 
@@ -140,12 +132,6 @@ impl CompatArgs for PipCompileCompatArgs {
             return Err(anyhow!(
                 "pip-compile's `--config` is unsupported (uv does not use a configuration file)"
             ));
-        }
-
-        if self.no_config {
-            warn_user!(
-                "pip-compile's `--no-config` has no effect (uv does not use a configuration file)"
-            );
         }
 
         if self.emit_options {
@@ -172,13 +158,9 @@ impl CompatArgs for PipCompileCompatArgs {
 ///
 /// These represent a subset of the `pip list` interface that uv supports by default.
 #[derive(Args)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct PipListCompatArgs {
     #[clap(long, hide = true)]
     disable_pip_version_check: bool,
-
-    #[clap(long, hide = true)]
-    outdated: bool,
 }
 
 impl CompatArgs for PipListCompatArgs {
@@ -186,14 +168,10 @@ impl CompatArgs for PipListCompatArgs {
     ///
     /// This method will warn when an argument is passed that has no effect but matches uv's
     /// behavior. If an argument is passed that does _not_ match uv's behavior (e.g.,
-    /// `--outdated`), this method will return an error.
+    /// `--disable-pip-version-check`), this method will return an error.
     fn validate(&self) -> Result<()> {
         if self.disable_pip_version_check {
             warn_user!("pip's `--disable-pip-version-check` has no effect");
-        }
-
-        if self.outdated {
-            return Err(anyhow!("pip's `--outdated` is unsupported"));
         }
 
         Ok(())
@@ -204,13 +182,9 @@ impl CompatArgs for PipListCompatArgs {
 ///
 /// These represent a subset of the `pip-sync` interface that uv supports by default.
 #[derive(Args)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct PipSyncCompatArgs {
     #[clap(short, long, hide = true)]
     ask: bool,
-
-    #[clap(long, hide = true)]
-    trusted_host: Option<String>,
 
     #[clap(long, hide = true)]
     python_executable: Option<String>,
@@ -265,22 +239,10 @@ impl CompatArgs for PipSyncCompatArgs {
             ));
         }
 
-        if self.trusted_host.is_some() {
-            return Err(anyhow!(
-                "pip-sync's `--trusted-host` is unsupported (uv always requires HTTPS)"
-            ));
-        }
-
         if self.config.is_some() {
             return Err(anyhow!(
                 "pip-sync's `--config` is unsupported (uv does not use a configuration file)"
             ));
-        }
-
-        if self.no_config {
-            warn_user!(
-                "pip-sync's `--no-config` has no effect (uv does not use a configuration file)"
-            );
         }
 
         if self.pip_args.is_some() {
@@ -303,11 +265,7 @@ enum Resolver {
 ///
 /// These represent a subset of the `virtualenv` interface that uv supports by default.
 #[derive(Args)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct VenvCompatArgs {
-    #[clap(long, hide = true)]
-    clear: bool,
-
     #[clap(long, hide = true)]
     no_seed: bool,
 
@@ -328,12 +286,6 @@ impl CompatArgs for VenvCompatArgs {
     /// behavior. If an argument is passed that does _not_ match uv's behavior, this method will
     /// return an error.
     fn validate(&self) -> Result<()> {
-        if self.clear {
-            warn_user!(
-                "virtualenv's `--clear` has no effect (uv always clears the virtual environment)"
-            );
-        }
-
         if self.no_seed {
             warn_user!(
                 "virtualenv's `--no-seed` has no effect (uv omits seed packages by default)"
@@ -362,7 +314,6 @@ impl CompatArgs for VenvCompatArgs {
 ///
 /// These represent a subset of the `pip install` interface that uv supports by default.
 #[derive(Args)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct PipInstallCompatArgs {
     #[clap(long, hide = true)]
     disable_pip_version_check: bool,
@@ -396,7 +347,6 @@ impl CompatArgs for PipInstallCompatArgs {
 ///
 /// These represent a subset of the `pip` interface that exists on all commands.
 #[derive(Args)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct PipGlobalCompatArgs {
     #[clap(long, hide = true)]
     disable_pip_version_check: bool,

@@ -28,13 +28,13 @@ By default, the script will run the resolution benchmarks when a `requirements.i
 is provided, and the installation benchmarks when a `requirements.txt` file is provided:
 
     # Run the resolution benchmarks against the Trio project.
-    uv run benchmark\
+    uv run resolver \
         --uv-path ../../target/release/uv \
         --uv-path ../../target/release/baseline \
         ../requirements/trio.in
 
     # Run the installation benchmarks against the Trio project.
-    uv run benchmark\
+    uv run resolver \
         --uv-path ../../target/release/uv \
         --uv-path ../../target/release/baseline \
         ../requirements/compiled/trio.txt
@@ -42,7 +42,7 @@ is provided, and the installation benchmarks when a `requirements.txt` file is p
 You can also specify the benchmark to run explicitly:
 
     # Run the "uncached install" benchmark against the Trio project.
-    uv run benchmark\
+    uv run resolver \
         --uv-path ../../target/release/uv \
         --uv-path ../../target/release/baseline \
         --benchmark install-cold \
@@ -158,7 +158,8 @@ class Suite(abc.ABC):
 
 
 class PipCompile(Suite):
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, *, python: str, path: str | None = None) -> None:
+        self.python = python
         self.name = path or "pip-compile"
         self.path = path or "pip-compile"
 
@@ -282,7 +283,8 @@ class PipCompile(Suite):
 
 
 class PipSync(Suite):
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, *, python: str, path: str | None = None) -> None:
+        self.python = python
         self.name = path or "pip-sync"
         self.path = path or "pip-sync"
 
@@ -302,7 +304,7 @@ class PipSync(Suite):
 
         return Command(
             name=f"{self.name} ({Benchmark.INSTALL_COLD.value})",
-            prepare=f"rm -rf {cache_dir} && virtualenv --clear -p 3.12 {venv_dir}",
+            prepare=f"rm -rf {cache_dir} && virtualenv --clear -p {self.python} {venv_dir}",
             command=[
                 self.path,
                 os.path.abspath(requirements_file),
@@ -319,7 +321,7 @@ class PipSync(Suite):
 
         return Command(
             name=f"{self.name} ({Benchmark.INSTALL_WARM.value})",
-            prepare=f"virtualenv --clear -p 3.12 {venv_dir}",
+            prepare=f"virtualenv --clear -p {self.python} {venv_dir}",
             command=[
                 self.path,
                 os.path.abspath(requirements_file),
@@ -332,7 +334,8 @@ class PipSync(Suite):
 
 
 class Poetry(Suite):
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, *, python: str, path: str | None = None) -> None:
+        self.python = python
         self.name = path or "poetry"
         self.path = path or "poetry"
 
@@ -359,7 +362,7 @@ class Poetry(Suite):
                 "bench",
                 "--no-interaction",
                 "--python",
-                "3.12.3",
+                self.python,
             ],
             cwd=cwd,
             stdout=subprocess.DEVNULL,
@@ -371,14 +374,13 @@ class Poetry(Suite):
             pyproject = tomli.load(fp)
 
         # Add the dependencies to the pyproject.toml.
-        pyproject["tool"]["poetry"]["dependencies"].update(
-            {
-                str(requirement.name): str(requirement.specifier)
-                if requirement.specifier
-                else "*"
-                for requirement in requirements
-            }
-        )
+        for requirement in requirements:
+            version = str(requirement.specifier) if requirement.specifier else "*"
+            if requirement.extras:
+                entry = {"version": version, "extras": sorted(requirement.extras)}
+            else:
+                entry = version
+            pyproject["tool"]["poetry"]["dependencies"][requirement.name] = entry
 
         with open(os.path.join(cwd, "pyproject.toml"), "wb") as fp:
             tomli_w.dump(pyproject, fp)
@@ -441,9 +443,9 @@ class Poetry(Suite):
         self.setup(requirements_file, cwd=cwd)
 
         poetry_lock = os.path.join(cwd, "poetry.lock")
-        assert not os.path.exists(
-            poetry_lock
-        ), f"Lockfile already exists at: {poetry_lock}"
+        assert not os.path.exists(poetry_lock), (
+            f"Lockfile already exists at: {poetry_lock}"
+        )
 
         # Run a resolution, to ensure that the lockfile exists.
         # TODO(charlie): Make this a `setup`.
@@ -497,9 +499,9 @@ class Poetry(Suite):
         self.setup(requirements_file, cwd=cwd)
 
         poetry_lock = os.path.join(cwd, "poetry.lock")
-        assert not os.path.exists(
-            poetry_lock
-        ), f"Lockfile already exists at: {poetry_lock}"
+        assert not os.path.exists(poetry_lock), (
+            f"Lockfile already exists at: {poetry_lock}"
+        )
 
         # Run a resolution, to ensure that the lockfile exists.
         # TODO(charlie): Make this a `setup`.
@@ -534,9 +536,9 @@ class Poetry(Suite):
         self.setup(requirements_file, cwd=cwd)
 
         poetry_lock = os.path.join(cwd, "poetry.lock")
-        assert not os.path.exists(
-            poetry_lock
-        ), f"Lockfile already exists at: {poetry_lock}"
+        assert not os.path.exists(poetry_lock), (
+            f"Lockfile already exists at: {poetry_lock}"
+        )
 
         # Run a resolution, to ensure that the lockfile exists.
         # TODO(charlie): Make this a `setup`.
@@ -559,7 +561,7 @@ class Poetry(Suite):
                 f"rm -rf {config_dir} && "
                 f"rm -rf {cache_dir} && "
                 f"rm -rf {data_dir} &&"
-                f"virtualenv --clear -p 3.12 {venv_dir} --no-seed"
+                f"virtualenv --clear -p {self.python} {venv_dir} --no-seed"
             ),
             command=[
                 f"POETRY_CONFIG_DIR={config_dir}",
@@ -579,9 +581,9 @@ class Poetry(Suite):
         self.setup(requirements_file, cwd=cwd)
 
         poetry_lock = os.path.join(cwd, "poetry.lock")
-        assert not os.path.exists(
-            poetry_lock
-        ), f"Lockfile already exists at: {poetry_lock}"
+        assert not os.path.exists(poetry_lock), (
+            f"Lockfile already exists at: {poetry_lock}"
+        )
 
         # Run a resolution, to ensure that the lockfile exists.
         subprocess.check_call(
@@ -599,7 +601,7 @@ class Poetry(Suite):
 
         return Command(
             name=f"{self.name} ({Benchmark.INSTALL_WARM.value})",
-            prepare=f"virtualenv --clear -p 3.12 {venv_dir}",
+            prepare=f"virtualenv --clear -p {self.python} {venv_dir}",
             command=[
                 f"POETRY_CONFIG_DIR={config_dir}",
                 f"POETRY_CACHE_DIR={cache_dir}",
@@ -616,7 +618,8 @@ class Poetry(Suite):
 
 
 class Pdm(Suite):
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, *, python: str, path: str | None = None) -> None:
+        self.python = python
         self.name = path or "pdm"
         self.path = path or "pdm"
 
@@ -636,7 +639,7 @@ class Pdm(Suite):
 
         # Create a PDM project.
         subprocess.check_call(
-            [self.path, "init", "--non-interactive", "--python", "3.12"],
+            [self.path, "init", "--non-interactive", "--python", self.python],
             cwd=cwd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -792,7 +795,7 @@ class Pdm(Suite):
             prepare=(
                 f"rm -rf {cache_dir} && "
                 f"{self.path} config cache_dir {cache_dir} && "
-                f"virtualenv --clear -p 3.12 {venv_dir} --no-seed"
+                f"virtualenv --clear -p {self.python} {venv_dir} --no-seed"
             ),
             command=[
                 f"VIRTUAL_ENV={venv_dir}",
@@ -826,7 +829,7 @@ class Pdm(Suite):
             name=f"{self.name} ({Benchmark.INSTALL_WARM.value})",
             prepare=(
                 f"{self.path} config cache_dir {cache_dir} && "
-                f"virtualenv --clear -p 3.12 {venv_dir} --no-seed"
+                f"virtualenv --clear -p {self.python} {venv_dir} --no-seed"
             ),
             command=[
                 f"VIRTUAL_ENV={venv_dir}",
@@ -839,9 +842,10 @@ class Pdm(Suite):
 
 
 class UvPip(Suite):
-    def __init__(self, *, path: str | None = None) -> Command | None:
+    def __init__(self, *, python: str, path: str | None = None) -> None:
         """Initialize a uv benchmark."""
-        self.name = path or "uv"
+        self.python = python
+        self.name = path or "uv pip"
         self.path = path or os.path.join(
             os.path.dirname(
                 os.path.dirname(
@@ -967,7 +971,7 @@ class UvPip(Suite):
 
         return Command(
             name=f"{self.name} ({Benchmark.INSTALL_COLD.value})",
-            prepare=f"rm -rf {cache_dir} && virtualenv --clear -p 3.12 {venv_dir}",
+            prepare=f"rm -rf {cache_dir} && virtualenv --clear -p {self.python} {venv_dir}",
             command=[
                 f"VIRTUAL_ENV={venv_dir}",
                 self.path,
@@ -985,7 +989,7 @@ class UvPip(Suite):
 
         return Command(
             name=f"{self.name} ({Benchmark.INSTALL_WARM.value})",
-            prepare=f"virtualenv --clear -p 3.12 {venv_dir}",
+            prepare=f"virtualenv --clear -p {self.python} {venv_dir}",
             command=[
                 f"VIRTUAL_ENV={venv_dir}",
                 self.path,
@@ -999,8 +1003,9 @@ class UvPip(Suite):
 
 
 class UvProject(Suite):
-    def __init__(self, *, path: str | None = None) -> Command | None:
+    def __init__(self, *, python: str, path: str | None = None) -> None:
         """Initialize a uv benchmark."""
+        self.python = python
         self.name = path or "uv"
         self.path = path or os.path.join(
             os.path.dirname(
@@ -1031,14 +1036,7 @@ class UvProject(Suite):
 
         # Create a Poetry project.
         subprocess.check_call(
-            [
-                self.path,
-                "init",
-                "--name",
-                "bench",
-                "--python",
-                "3.12.3",
-            ],
+            [self.path, "init", "--name", "bench", "--python", self.python],
             cwd=cwd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1073,7 +1071,7 @@ class UvProject(Suite):
                 "--directory",
                 cwd,
                 "--python",
-                "3.12.3",
+                self.python,
             ],
         )
 
@@ -1094,7 +1092,7 @@ class UvProject(Suite):
                 "--directory",
                 cwd,
                 "--python",
-                "3.12.3",
+                self.python,
             ],
         )
 
@@ -1147,7 +1145,7 @@ class UvProject(Suite):
                 "--directory",
                 cwd,
                 "--python",
-                "3.12.3",
+                self.python,
             ],
         )
 
@@ -1180,7 +1178,7 @@ class UvProject(Suite):
                 "--directory",
                 cwd,
                 "--python",
-                "3.12.3",
+                self.python,
             ],
         )
 
@@ -1207,7 +1205,7 @@ class UvProject(Suite):
             name=f"{self.name} ({Benchmark.INSTALL_COLD.value})",
             prepare=(
                 f"rm -rf {cache_dir} && "
-                f"virtualenv --clear -p 3.12 {venv_dir} --no-seed"
+                f"virtualenv --clear -p {self.python} {venv_dir} --no-seed"
             ),
             command=[
                 f"VIRTUAL_ENV={venv_dir}",
@@ -1218,7 +1216,7 @@ class UvProject(Suite):
                 "--directory",
                 cwd,
                 "--python",
-                "3.12.3",
+                self.python,
             ],
         )
 
@@ -1243,7 +1241,7 @@ class UvProject(Suite):
 
         return Command(
             name=f"{self.name} ({Benchmark.INSTALL_COLD.value})",
-            prepare=(f"virtualenv --clear -p 3.12 {venv_dir} --no-seed"),
+            prepare=(f"virtualenv --clear -p {self.python} {venv_dir} --no-seed"),
             command=[
                 f"VIRTUAL_ENV={venv_dir}",
                 self.path,
@@ -1253,7 +1251,7 @@ class UvProject(Suite):
                 "--directory",
                 cwd,
                 "--python",
-                "3.12.3",
+                self.python,
             ],
         )
 
@@ -1276,6 +1274,12 @@ def main():
     )
     parser.add_argument("--json", action="store_true", help="Export results to JSON.")
     parser.add_argument(
+        "--python",
+        type=str,
+        help="The Python version to use when benchmarking (e.g., `3.11.7`).",
+        default="3.12.3",
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         help="The number of warmup runs to perform.",
@@ -1286,6 +1290,11 @@ def main():
         type=int,
         help="The minimum number of runs to perform.",
         default=10,
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        help="The number of runs to perform.",
     )
     parser.add_argument(
         "--benchmark",
@@ -1371,8 +1380,10 @@ def main():
 
     verbose = args.verbose
     json = args.json
+    python = args.python
     warmup = args.warmup
     min_runs = args.min_runs
+    runs = args.runs
 
     requirements_file = os.path.abspath(args.file)
     if not os.path.exists(requirements_file):
@@ -1381,38 +1392,39 @@ def main():
     # Determine the tools to benchmark, based on the user-provided arguments.
     suites = []
     if args.pip_sync:
-        suites.append(PipSync())
+        suites.append(PipSync(python=python))
     if args.pip_compile:
-        suites.append(PipCompile())
+        suites.append(PipCompile(python=python))
     if args.poetry:
-        suites.append(Poetry())
+        suites.append(Poetry(python=python))
     if args.pdm:
-        suites.append(Pdm())
+        suites.append(Pdm(python=python))
     if args.uv_pip:
-        suites.append(UvPip())
+        suites.append(UvPip(python=python))
     if args.uv_project:
-        suites.append(UvProject())
+        suites.append(UvProject(python=python))
     for path in args.pip_sync_path or []:
-        suites.append(PipSync(path=path))
+        suites.append(PipSync(python=python, path=path))
     for path in args.pip_compile_path or []:
-        suites.append(PipCompile(path=path))
+        suites.append(PipCompile(python=python, path=path))
     for path in args.poetry_path or []:
-        suites.append(Poetry(path=path))
+        suites.append(Poetry(python=python, path=path))
     for path in args.pdm_path or []:
-        suites.append(Pdm(path=path))
+        suites.append(Pdm(python=python, path=path))
     for path in args.uv_pip_path or []:
-        suites.append(UvPip(path=path))
+        suites.append(UvPip(python=python, path=path))
     for path in args.uv_project_path or []:
-        suites.append(UvProject(path=path))
+        suites.append(UvProject(python=python, path=path))
 
     # If no tools were specified, benchmark all tools.
     if not suites:
         suites = [
-            PipSync(),
-            PipCompile(),
-            Poetry(),
-            UvPip(),
-            UvProject(),
+            PipSync(python=python),
+            PipCompile(python=python),
+            Poetry(python=python),
+            Pdm(python=python),
+            UvPip(python=python),
+            UvProject(python=python),
         ]
 
     # Determine the benchmarks to run, based on user input. If no benchmarks were
@@ -1453,6 +1465,7 @@ def main():
                     commands=commands,
                     warmup=warmup,
                     min_runs=min_runs,
+                    runs=runs,
                     verbose=verbose,
                     json=json,
                 )

@@ -34,9 +34,9 @@ drawbacks:
    behavior, and many users may _not_ expect uv to read configuration files intended for other
    tools.
 
-Instead, uv supports its own environment variables, like `UV_INDEX_URL`. In the future, uv will also
-support persistent configuration in its own configuration file format (e.g., `pyproject.toml` or
-`uv.toml` or similar). For more, see [#651](https://github.com/astral-sh/uv/issues/651).
+Instead, uv supports its own environment variables, like `UV_INDEX_URL`. uv also supports persistent
+configuration in a `uv.toml` file or a `[tool.uv.pip]` section of `pyproject.toml`. For more
+information, see [Configuration files](../concepts/configuration-files.md).
 
 ## Pre-release compatibility
 
@@ -74,35 +74,6 @@ and are instead focused on behavior for a _single_ version specifier. As such, t
 questions around the correct and intended behavior for pre-releases in the packaging ecosystem more
 broadly.
 
-## Local version identifiers
-
-uv does not implement spec-compliant handling of local version identifiers (e.g., `1.2.3+local`).
-This is considered a known limitation. Although local version identifiers are rare in published
-packages (and, e.g., disallowed on PyPI), they're common in the PyTorch ecosystem, and uv's approach
-to local versions _does_ support typical PyTorch workflows to succeed out-of-the-box.
-
-[PEP 440](https://peps.python.org/pep-0440/#version-specifiers) specifies that the local version
-segment should typically be ignored when evaluating version specifiers, with a few exceptions. For
-example, `foo==1.2.3` should accept `1.2.3+local`, but `foo==1.2.3+local` should _not_ accept
-`1.2.3`. These asymmetries are hard to model in a resolution algorithm. As such, uv treats `1.2.3`
-and `1.2.3+local` as entirely separate versions, but respects local versions provided as direct
-dependencies throughout the resolution, such that if you provide `foo==1.2.3+local` as a direct
-dependency, `1.2.3+local` _will_ be accepted for any transitive dependencies that request
-`foo==1.2.3`.
-
-To take an example from the PyTorch ecosystem, it's common to specify `torch==2.0.0+cu118` and
-`torchvision==0.15.1+cu118` as direct dependencies. `torchvision @ 0.15.1+cu118` declares a
-dependency on `torch==2.0.0`. In this case, uv would recognize that `torch==2.0.0+cu118` satisfies
-the specifier, since it was provided as a direct dependency.
-
-As compared to pip, the main differences in observed behavior are as follows:
-
-- In general, local versions must be provided as direct dependencies. Resolution may succeed for
-  transitive dependencies that request a non-local version, but this is not guaranteed.
-- If _only_ local versions exist for a package `foo` at a given version (e.g., `1.2.3+local` exists,
-  but `1.2.3` does not), `uv pip install foo==1.2.3` will fail, while `pip install foo==1.2.3` will
-  resolve to an arbitrary local version.
-
 ## Packages that exist on multiple indexes
 
 In both uv and `pip`, users can specify multiple package indexes from which to search for the
@@ -137,7 +108,7 @@ As of v0.1.39, users can opt in to `pip`-style behavior for multiple indexes via
 `--index-strategy` command-line option, or the `UV_INDEX_STRATEGY` environment variable, which
 supports the following values:
 
-- `first-match` (default): Search for each package across all indexes, limiting the candidate
+- `first-index` (default): Search for each package across all indexes, limiting the candidate
   versions to those present in the first index that contains the package, prioritizing the
   `--extra-index-url` indexes over the default index URL.
 - `unsafe-first-match`: Search for each package across all indexes, but prefer the first index with
@@ -148,27 +119,50 @@ supports the following values:
 While `unsafe-best-match` is the closest to `pip`'s behavior, it exposes users to the risk of
 "dependency confusion" attacks.
 
-In the future, uv will support pinning packages to dedicated indexes (see:
-[#171](https://github.com/astral-sh/uv/issues/171)). Additionally,
-[PEP 708](https://peps.python.org/pep-0708/) is a provisional standard that aims to address the
-"dependency confusion" issue across package registries and installers.
+uv also supports pinning packages to dedicated indexes (see:
+[_Indexes_](../concepts/indexes.md#pinning-a-package-to-an-index)), such that a given package is
+_always_ installed from a specific index.
 
-## Transitive direct URL dependencies for constraints and overrides
+## PEP 517 build isolation
 
-While uv does support URL dependencies (e.g., `black @ https://...`), it does not support
-_transitive_ (i.e., "nested") direct URL dependencies for constraints and overrides.
+uv uses [PEP 517](https://peps.python.org/pep-0517/) build isolation by default (akin to
+`pip install --use-pep517`), following `pypa/build` and in anticipation of `pip` defaulting to PEP
+517 builds in the future ([pypa/pip#9175](https://github.com/pypa/pip/issues/9175)).
 
-Specifically, if a constraint or override is defined using a direct URL dependency, and the
-constrained package has a direct URL dependency of its own, uv _may_ reject that transitive direct
-URL dependency during resolution.
+If a package fails to install due to a missing build-time dependency, try using a newer version of
+the package; if the problem persists, consider filing an issue with the package maintainer,
+requesting that they update the packaging setup to declare the correct PEP 517 build-time
+dependencies.
 
-uv also makes the assumption that non-URL dependencies won't introduce URL dependencies (i.e., that
-dependencies fetched from a registry will not themselves have direct URL dependencies). If a non-URL
-dependency _does_ introduce a URL dependency, uv will reject the URL dependency during resolution.
+As an escape hatch, you can preinstall a package's build dependencies, then run `uv pip install`
+with `--no-build-isolation`, as in:
 
-If uv rejects a transitive URL dependency in either case, the best course of action is to provide
-the URL dependency as a direct dependency in the `requirements.in` file, rather than as a
-constraint, override, or transitive dependency.
+```shell
+uv pip install wheel && uv pip install --no-build-isolation biopython==1.77
+```
+
+For a list of packages that are known to fail under PEP 517 build isolation, see
+[#2252](https://github.com/astral-sh/uv/issues/2252).
+
+## Transitive URL dependencies
+
+While uv includes first-class support for URL dependencies (e.g., `ruff @ https://...`), it differs
+from pip in its handling of _transitive_ URL dependencies in two ways.
+
+First, uv makes the assumption that non-URL dependencies do not introduce URL dependencies into the
+resolution. In other words, it assumes that dependencies fetched from a registry do not themselves
+depend on URLs. If a non-URL dependency _does_ introduce a URL dependency, uv will reject the URL
+dependency during resolution. (Note that PyPI does not allow published packages to depend on URL
+dependencies; other registries may be more permissive.)
+
+Second, if a constraint (`--constraint`) or override (`--override`) is defined using a direct URL
+dependency, and the constrained package has a direct URL dependency of its own, uv _may_ reject that
+transitive direct URL dependency during resolution, if the URL isn't referenced elsewhere in the set
+of input requirements.
+
+If uv rejects a transitive URL dependency, the best course of action is to provide the URL
+dependency as a direct dependency in the relevant `pyproject.toml` or `requirement.in` file, as the
+above constraints do not apply to direct dependencies.
 
 ## Virtual environments by default
 
@@ -204,7 +198,7 @@ _should_ be equally valid.
 
 For example, consider:
 
-```text title="requirements.txt"
+```python title="requirements.in"
 starlette
 fastapi
 ```
@@ -217,9 +211,9 @@ If a resolver prioritizes including the most recent version of `starlette`, it w
 older version of `fastapi` that excludes the upper bound on `starlette`. In practice, this requires
 falling back to `fastapi==0.1.17`:
 
-```text
+```python title="requirements.txt"
 # This file was autogenerated by uv via the following command:
-#    uv pip compile -
+#    uv pip compile requirements.in
 annotated-types==0.6.0
     # via pydantic
 anyio==4.3.0
@@ -245,8 +239,9 @@ Alternatively, if a resolver prioritizes including the most recent version of `f
 need to use an older version of `starlette` that satisfies the upper bound. In practice, this
 requires falling back to `starlette==0.36.3`:
 
-```text
-#    uv pip compile -
+```python title="requirements.txt"
+# This file was autogenerated by uv via the following command:
+#    uv pip compile requirements.in
 annotated-types==0.6.0
     # via pydantic
 anyio==4.3.0
@@ -316,17 +311,65 @@ package is "allowed" in such cases without building its metadata.
 Both pip and uv allow editables requirements to be built and installed even when `--only-binary` is
 provided. For example, `uv pip install -e . --only-binary :all:` is allowed.
 
+## `--no-binary` enforcement
+
+The `--no-binary` argument is used to restrict installation to source distributions. When
+`--no-binary` is provided, uv will refuse to install pre-built binary distributions, but _will_
+reuse any binary distributions that are already present in the local cache.
+
+Additionally, and in contrast to pip, uv's resolver will still read metadata from pre-built binary
+distributions when `--no-binary` is provided.
+
+## `manylinux_compatible` enforcement
+
+[PEP 600](https://peps.python.org/pep-0600/#package-installers) describes a mechanism through which
+Python distributors can opt out of `manylinux` compatibility by defining a `manylinux_compatible`
+function on the `_manylinux` standard library module.
+
+uv respects `manylinux_compatible`, but only tests against the current glibc version, and applies
+the return value of `manylinux_compatible` globally.
+
+In other words, if `manylinux_compatible` returns `True`, uv will treat the system as
+`manylinux`-compatible; if it returns `False`, uv will treat the system as `manylinux`-incompatible,
+without calling `manylinux_compatible` for every glibc version.
+
+This approach is not a complete implementation of the spec, but is compatible with common blanket
+`manylinux_compatible` implementations like
+[`no-manylinux`](https://pypi.org/project/no-manylinux/):
+
+```python
+from __future__ import annotations
+manylinux1_compatible = False
+manylinux2010_compatible = False
+manylinux2014_compatible = False
+
+
+def manylinux_compatible(*_, **__):  # PEP 600
+    return False
+```
+
 ## Bytecode compilation
 
-Unlike pip, uv does not compile `.py` files to `.pyc` files during installation by default (i.e., uv
-does not create or populate `__pycache__` directories). To enable bytecode compilation during
-installs, pass the `--compile-bytecode` flag to `uv pip install` or `uv pip sync`.
+Unlike `pip`, uv does not compile `.py` files to `.pyc` files during installation by default (i.e.,
+uv does not create or populate `__pycache__` directories). To enable bytecode compilation during
+installs, pass the `--compile-bytecode` flag to `uv pip install` or `uv pip sync`, or set the
+`UV_COMPILE_BYTECODE` environment variable to `1`.
+
+Skipping bytecode compilation can be undesirable in workflows; for example, we recommend enabling
+bytecode compilation in [Docker builds](../guides/integration/docker.md) to improve startup times
+(at the cost of increased build times).
+
+As bytecode compilation suppresses various warnings issued by the Python interpreter, in rare cases
+you may seen `SyntaxWarning` or `DeprecationWarning` messages when running Python code that was
+installed with uv that do not appear when using `pip`. These are valid warnings, but are typically
+hidden by the bytecode compilation process, and can either be ignored, fixed upstream, or similarly
+suppressed by enabling bytecode compilation in uv.
 
 ## Strictness and spec enforcement
 
 uv tends to be stricter than `pip`, and will often reject packages that `pip` would install. For
-example, uv omits packages with invalid version specifiers in its metadata, which `pip` similarly
-plans to exclude in a [future release](https://github.com/pypa/pip/issues/12063).
+example, uv rejects HTML indexes with invalid URL fragments (see:
+[PEP 503](https://peps.python.org/pep-0503/)), while `pip` will ignore such fragments.
 
 In some cases, uv implements lenient behavior for popular packages that are known to have specific
 spec compliance issues.
@@ -343,7 +386,6 @@ does support a large subset.
 Missing options and subcommands are prioritized based on user demand and the complexity of the
 implementation, and tend to be tracked in individual issues. For example:
 
-- [`--prefix`](https://github.com/astral-sh/uv/issues/3076)
 - [`--trusted-host`](https://github.com/astral-sh/uv/issues/1339)
 - [`--user`](https://github.com/astral-sh/uv/issues/2077)
 
@@ -354,11 +396,11 @@ issues to convey your interest.
 ## Registry authentication
 
 uv does not support `pip`'s `auto` or `import` options for `--keyring-provider`. At present, only
-the `subproces` option is supported.
+the `subprocess` option is supported.
 
 Unlike `pip`, uv does not enable keyring authentication by default.
 
-Unlike `pip`, uv does not wait until a request returns a HTTP 401 before searching for
+Unlike `pip`, uv does not wait until a request returns an HTTP 401 before searching for
 authentication. uv attaches authentication to all requests for hosts with credentials available.
 
 ## `egg` support
@@ -373,6 +415,19 @@ occasionally found in Docker images and Conda environments) and (2) legacy edita
 Specifically, uv does not support installing new `.egg-info`- or `.egg-link`-style distributions,
 but will respect any such existing distributions during resolution, list them with `uv pip list` and
 `uv pip freeze`, and uninstall them with `uv pip uninstall`.
+
+## Build constraints
+
+When constraints are provided via `--constraint` (or `UV_CONSTRAINT`), uv will _not_ apply the
+constraints when resolving build dependencies (i.e., to build a source distribution). Instead, build
+constraints should be provided via the dedicated `--build-constraint` (or `UV_BUILD_CONSTRAINT`)
+setting.
+
+pip, meanwhile, applies constraints to build dependencies when specified via `PIP_CONSTRAINT`, but
+not when provided via `--constraint` on the command line.
+
+For example, to ensure that `setuptools 60.0.0` is used to build any packages with a build
+dependency on `setuptools`, use `--build-constraint`, rather than `--constraint`.
 
 ## `pip compile` defaults
 
@@ -392,6 +447,67 @@ By default, uv does not write any index URLs to the output file, while `pip-comp
 in the output file, pass the `--emit-index-url` flag to `uv pip compile`. Unlike `pip-compile`, uv
 will include all index URLs when `--emit-index-url` is passed, including the default index URL.
 
-By default, uv does not write any `--no-build` or `--only-binary` options to the output file, unlike
-`pip-compile`. To include these options in the output file, pass the `--emit-build-options` flag to
-`uv pip compile`.
+## `requires-python` upper bounds
+
+When evaluating `requires-python` ranges for dependencies, uv only considers lower bounds and
+ignores upper bounds entirely. For example, `>=3.8, <4` is treated as `>=3.8`. Respecting upper
+bounds on `requires-python` often leads to formally correct but practically incorrect resolutions,
+as, e.g., resolvers will backtrack to the first published version that omits the upper bound (see:
+[`Requires-Python` upper limits](https://discuss.python.org/t/requires-python-upper-limits/12663)).
+
+## `requires-python` specifiers
+
+When evaluating Python versions against `requires-python` specifiers, uv truncates the candidate
+version to the major, minor, and patch components, ignoring (e.g.) pre-release and post-release
+identifiers.
+
+For example, a project that declares `requires-python: >=3.13` will accept Python 3.13.0b1. While
+3.13.0b1 is not strictly greater than 3.13, it is greater than 3.13 when the pre-release identifier
+is omitted.
+
+While this is not strictly compliant with [PEP 440](https://peps.python.org/pep-0440/), it _is_
+consistent with
+[pip](https://github.com/pypa/pip/blob/24.1.1/src/pip/_internal/resolution/resolvelib/candidates.py#L540).
+
+## Package priority
+
+There are usually many possible solutions given a set of requirements, and a resolver must choose
+between them. uv's resolver and pip's resolver have a different set of package priorities. While
+both resolvers use the user-provided order as one of their priorities, pip has additional
+[priorities](https://pip.pypa.io/en/stable/topics/more-dependency-resolution/#the-resolver-algorithm)
+that uv does not have. Hence, uv is more likely to be affected by a change in user order than pip
+is.
+
+For example, `uv pip install foo bar` prioritizes newer versions of `foo` over `bar` and could
+result in a different resolution than `uv pip install bar foo`. Similarly, this behavior applies to
+the ordering of requirements in input files for `uv pip compile`.
+
+## Wheel filename and metadata validation
+
+By default, uv will reject wheels whose filenames are inconsistent with the wheel metadata inside
+the file. For example, a wheel named `foo-1.0.0-py3-none-any.whl` that contains metadata indicating
+the version is `1.0.1` will be rejected by uv, but accepted by pip.
+
+To force uv to accept such wheels, set `UV_SKIP_WHEEL_FILENAME_CHECK=1` in the environment.
+
+## Package name normalization
+
+By default, uv normalizes package names to match their
+[PEP 503-compliant forms](https://packaging.python.org/en/latest/specifications/name-normalization/#name-normalization)
+and uses those normalized names in all output contexts. This differs from pip, which tends to
+preserve the verbatim package name as published on the registry.
+
+For example, `uv pip list` displays normalized packages names (e.g., `docstring-parser`), while
+`pip list` displays non-normalized package names (e.g., `docstring_parser`):
+
+```shell
+(venv) $ diff --side-by-side  <(pip list) <(uv pip list)
+Package          Version					Package          Version
+---------------- -------					---------------- -------
+docstring_parser 0.16					      |	docstring-parser 0.16
+jaraco.classes   3.4.0					      |	jaraco-classes   3.4.0
+more-itertools   10.7.0				    		more-itertools   10.7.0
+pip              25.1					    	pip              25.1
+PyMuPDFb         1.24.10				      |	pymupdfb         1.24.10
+PyPDF2           3.0.1					      |	pypdf2           3.0.1
+```

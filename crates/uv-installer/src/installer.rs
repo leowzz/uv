@@ -1,35 +1,46 @@
-use anyhow::{Context, Error, Result};
-use install_wheel_rs::{linker::LinkMode, Layout};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::convert;
+use std::sync::{Arc, LazyLock};
+
+use anyhow::{Context, Error, Result};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use tokio::sync::oneshot;
 use tracing::instrument;
 
-use distribution_types::CachedDist;
 use uv_cache::Cache;
+use uv_configuration::RAYON_INITIALIZE;
+use uv_distribution_types::CachedDist;
+use uv_install_wheel::{Layout, LinkMode};
+use uv_preview::Preview;
 use uv_python::PythonEnvironment;
 
 pub struct Installer<'a> {
     venv: &'a PythonEnvironment,
     link_mode: LinkMode,
     cache: Option<&'a Cache>,
-    reporter: Option<Box<dyn Reporter>>,
-    installer_name: Option<String>,
+    reporter: Option<Arc<dyn Reporter>>,
+    /// The name of the [`Installer`].
+    name: Option<String>,
+    /// The metadata associated with the [`Installer`].
+    metadata: bool,
+    /// Preview settings for the installer.
+    preview: Preview,
 }
 
 impl<'a> Installer<'a> {
     /// Initialize a new installer.
-    pub fn new(venv: &'a PythonEnvironment) -> Self {
+    pub fn new(venv: &'a PythonEnvironment, preview: Preview) -> Self {
         Self {
             venv,
             link_mode: LinkMode::default(),
             cache: None,
             reporter: None,
-            installer_name: Some("uv".to_string()),
+            name: Some("uv".to_string()),
+            metadata: true,
+            preview,
         }
     }
 
-    /// Set the [`LinkMode`][`install_wheel_rs::linker::LinkMode`] to use for this installer.
+    /// Set the [`LinkMode`][`uv_install_wheel::LinkMode`] to use for this installer.
     #[must_use]
     pub fn with_link_mode(self, link_mode: LinkMode) -> Self {
         Self { link_mode, ..self }
@@ -46,9 +57,9 @@ impl<'a> Installer<'a> {
 
     /// Set the [`Reporter`] to use for this installer.
     #[must_use]
-    pub fn with_reporter(self, reporter: impl Reporter + 'static) -> Self {
+    pub fn with_reporter(self, reporter: Arc<dyn Reporter>) -> Self {
         Self {
-            reporter: Some(Box::new(reporter)),
+            reporter: Some(reporter),
             ..self
         }
     }
@@ -57,7 +68,16 @@ impl<'a> Installer<'a> {
     #[must_use]
     pub fn with_installer_name(self, installer_name: Option<String>) -> Self {
         Self {
-            installer_name,
+            name: installer_name,
+            ..self
+        }
+    }
+
+    /// Set whether to install uv-specifier files in the dist-info directory.
+    #[must_use]
+    pub fn with_installer_metadata(self, installer_metadata: bool) -> Self {
+        Self {
+            metadata: installer_metadata,
             ..self
         }
     }
@@ -70,7 +90,9 @@ impl<'a> Installer<'a> {
             cache,
             link_mode,
             reporter,
-            installer_name,
+            name: installer_name,
+            metadata: installer_metadata,
+            preview,
         } = self;
 
         if cache.is_some_and(Cache::is_temporary) {
@@ -85,16 +107,22 @@ impl<'a> Installer<'a> {
 
         let layout = venv.interpreter().layout();
         let relocatable = venv.relocatable();
+        // Initialize the threadpool with the user settings.
+        LazyLock::force(&RAYON_INITIALIZE);
         rayon::spawn(move || {
             let result = install(
                 wheels,
-                layout,
-                installer_name,
+                &layout,
+                installer_name.as_deref(),
                 link_mode,
-                reporter,
+                reporter.as_ref(),
                 relocatable,
+                installer_metadata,
+                preview,
             );
-            tx.send(result).unwrap();
+
+            // This may fail if the main task was cancelled.
+            let _ = tx.send(result);
         });
 
         rx.await
@@ -115,11 +143,13 @@ impl<'a> Installer<'a> {
 
         install(
             wheels,
-            self.venv.interpreter().layout(),
-            self.installer_name,
+            &self.venv.interpreter().layout(),
+            self.name.as_deref(),
             self.link_mode,
-            self.reporter,
+            self.reporter.as_ref(),
             self.venv.relocatable(),
+            self.metadata,
+            self.preview,
         )
     }
 }
@@ -128,26 +158,35 @@ impl<'a> Installer<'a> {
 #[instrument(skip_all, fields(num_wheels = %wheels.len()))]
 fn install(
     wheels: Vec<CachedDist>,
-    layout: Layout,
-    installer_name: Option<String>,
+    layout: &Layout,
+    installer_name: Option<&str>,
     link_mode: LinkMode,
-    reporter: Option<Box<dyn Reporter>>,
+    reporter: Option<&Arc<dyn Reporter>>,
     relocatable: bool,
+    installer_metadata: bool,
+    preview: Preview,
 ) -> Result<Vec<CachedDist>> {
-    let locks = install_wheel_rs::linker::Locks::default();
+    // Initialize the threadpool with the user settings.
+    LazyLock::force(&RAYON_INITIALIZE);
+    let locks = uv_install_wheel::Locks::new(preview);
     wheels.par_iter().try_for_each(|wheel| {
-        install_wheel_rs::linker::install_wheel(
-            &layout,
+        uv_install_wheel::install_wheel(
+            layout,
             relocatable,
             wheel.path(),
             wheel.filename(),
             wheel
-                .parsed_url()?
-                .as_ref()
-                .map(pypi_types::DirectUrl::try_from)
-                .transpose()?
+                .parsed_url()
+                .map(uv_pypi_types::DirectUrl::from)
                 .as_ref(),
-            installer_name.as_deref(),
+            if wheel.cache_info().is_empty() {
+                None
+            } else {
+                Some(wheel.cache_info())
+            },
+            wheel.build_info(),
+            installer_name,
+            installer_metadata,
             link_mode,
             &locks,
         )

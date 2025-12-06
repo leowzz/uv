@@ -16,7 +16,7 @@ documentation_.
 1. If a message ends with a single relevant value, precede it with a colon, e.g.,
    `This is the value: value`. If the value is a literal, wrap it in backticks.
 1. Markdown files should be wrapped at 100 characters.
-1. Use a space, not an equals sign, for command line arguments with a value, e.g.
+1. Use a space, not an equals sign, for command-line arguments with a value, e.g.
    `--resolution lowest`, not `--resolution=lowest`.
 
 ## Styling uv
@@ -84,8 +84,9 @@ The documentation is divided into:
 
 1. All code blocks should have a language marker.
 1. When using `console` syntax, use `$` to indicate commands — everything else is output.
-1. Do not use the `bash` syntax when displaying command output.
-1. Command output should rarely be included — it's hard to keep up to date.
+1. Never use the `bash` syntax when displaying command output.
+1. Prefer `console` with `$` prefixed commands over `bash`.
+1. Command output should rarely be included — it's hard to keep up-to-date.
 1. Use `title` for example files, e.g., `pyproject.toml`, `Dockerfile`, or `example.py`.
 
 ## CLI
@@ -121,7 +122,7 @@ The documentation is divided into:
 
 ### Warnings
 
-1. `warn_user` and `warn_user_once` are shown without the `--verbose `flag.
+1. `warn_user` and `warn_user_once` are shown without the `--verbose` flag.
    - These methods should be preferred over tracing warnings when the warning is actionable.
    - Deprecation warnings should use these methods.
 1. Deprecation warnings must be actionable.

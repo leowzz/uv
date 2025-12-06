@@ -1,15 +1,25 @@
+use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use rustc_hash::FxHashSet;
 
-use distribution_types::{CachedDist, IndexLocations, InstalledDist, Resolution, SourceDist};
-use pep508_rs::PackageName;
-use pypi_types::Requirement;
 use uv_cache::Cache;
-use uv_configuration::{BuildKind, BuildOptions};
+use uv_configuration::{BuildKind, BuildOptions, BuildOutput, SourceStrategy};
+use uv_distribution_filename::DistFilename;
+use uv_distribution_types::{
+    CachedDist, ConfigSettings, DependencyMetadata, DistributionId, ExtraBuildRequires,
+    ExtraBuildVariables, IndexCapabilities, IndexLocations, InstalledDist, IsBuildBackendError,
+    PackageConfigSettings, Requirement, Resolution, SourceDist,
+};
 use uv_git::GitResolver;
+use uv_normalize::PackageName;
 use uv_python::{Interpreter, PythonEnvironment};
+use uv_workspace::WorkspaceCache;
+
+use crate::{BuildArena, BuildIsolation};
 
 ///  Avoids cyclic crate dependencies between resolver, installer and builder.
 ///
@@ -35,21 +45,26 @@ use uv_python::{Interpreter, PythonEnvironment};
 ///         │          └───────▲────────┘          │
 ///         │                  │                   │
 ///         │                  │                   │
-/// ┌───────┴────────┐ ┌───────┴────────┐ ┌────────┴───────┐
-/// │  uv-resolver   │ │  uv-installer  │ │    uv-build    │
-/// └───────▲────────┘ └───────▲────────┘ └────────▲───────┘
+/// ┌───────┴────────┐ ┌───────┴────────┐ ┌────────┴────────────────┐
+/// │  uv-resolver   │ │  uv-installer  │ │    uv-build-frontend    │
+/// └───────▲────────┘ └───────▲────────┘ └────────▲────────────────┘
 ///         │                  │                   │
 ///         └─────────────┐    │    ┌──────────────┘
 ///                    ┌──┴────┴────┴───┐
-///                    │    uv-types   │
+///                    │    uv-types    │
 ///                    └────────────────┘
 /// ```
 ///
 /// Put in a different way, the types here allow `uv-resolver` to depend on `uv-build` and
-/// `uv-build` to depend on `uv-resolver` without having actual crate dependencies between
+/// `uv-build-frontend` to depend on `uv-resolver` without having actual crate dependencies between
 /// them.
 pub trait BuildContext {
     type SourceDistBuilder: SourceBuildTrait;
+
+    // Note: this function is async deliberately, because downstream code may need to
+    // run async code to get the interpreter, to resolve the Python version.
+    /// Return a reference to the interpreter.
+    fn interpreter(&self) -> impl Future<Output = &Interpreter> + '_;
 
     /// Return a reference to the cache.
     fn cache(&self) -> &Cache;
@@ -57,9 +72,14 @@ pub trait BuildContext {
     /// Return a reference to the Git resolver.
     fn git(&self) -> &GitResolver;
 
-    /// All (potentially nested) source distribution builds use the same base python and can reuse
-    /// it's metadata (e.g. wheel compatibility tags).
-    fn interpreter(&self) -> &Interpreter;
+    /// Return a reference to the build arena.
+    fn build_arena(&self) -> &BuildArena<Self::SourceDistBuilder>;
+
+    /// Return a reference to the discovered registry capabilities.
+    fn capabilities(&self) -> &IndexCapabilities;
+
+    /// Return a reference to any pre-defined static metadata.
+    fn dependency_metadata(&self) -> &DependencyMetadata;
 
     /// Whether source distribution building or pre-built wheels is disabled.
     ///
@@ -67,14 +87,36 @@ pub trait BuildContext {
     /// This method exists to avoid fetching source distributions if we know we can't build them.
     fn build_options(&self) -> &BuildOptions;
 
+    /// The isolation mode used for building source distributions.
+    fn build_isolation(&self) -> BuildIsolation<'_>;
+
+    /// The [`ConfigSettings`] used to build distributions.
+    fn config_settings(&self) -> &ConfigSettings;
+
+    /// The [`ConfigSettings`] used to build a specific package.
+    fn config_settings_package(&self) -> &PackageConfigSettings;
+
+    /// Whether to incorporate `tool.uv.sources` when resolving requirements.
+    fn sources(&self) -> SourceStrategy;
+
     /// The index locations being searched.
-    fn index_locations(&self) -> &IndexLocations;
+    fn locations(&self) -> &IndexLocations;
+
+    /// Workspace discovery caching.
+    fn workspace_cache(&self) -> &WorkspaceCache;
+
+    /// Get the extra build requirements.
+    fn extra_build_requires(&self) -> &ExtraBuildRequires;
+
+    /// Get the extra build variables.
+    fn extra_build_variables(&self) -> &ExtraBuildVariables;
 
     /// Resolve the given requirements into a ready-to-install set of package versions.
     fn resolve<'a>(
         &'a self,
         requirements: &'a [Requirement],
-    ) -> impl Future<Output = Result<Resolution>> + 'a;
+        build_stack: &'a BuildStack,
+    ) -> impl Future<Output = Result<Resolution, impl IsBuildBackendError>> + 'a;
 
     /// Install the given set of package versions into the virtual environment. The environment must
     /// use the same base Python as [`BuildContext::interpreter`]
@@ -82,7 +124,8 @@ pub trait BuildContext {
         &'a self,
         resolution: &'a Resolution,
         venv: &'a PythonEnvironment,
-    ) -> impl Future<Output = Result<Vec<CachedDist>>> + 'a;
+        build_stack: &'a BuildStack,
+    ) -> impl Future<Output = Result<Vec<CachedDist>, impl IsBuildBackendError>> + 'a;
 
     /// Set up a source distribution build by installing the required dependencies. A wrapper for
     /// `uv_build::SourceBuild::setup`.
@@ -95,10 +138,30 @@ pub trait BuildContext {
         &'a self,
         source: &'a Path,
         subdirectory: Option<&'a Path>,
-        version_id: &'a str,
+        install_path: &'a Path,
+        version_id: Option<&'a str>,
         dist: Option<&'a SourceDist>,
+        sources: SourceStrategy,
         build_kind: BuildKind,
-    ) -> impl Future<Output = Result<Self::SourceDistBuilder>> + 'a;
+        build_output: BuildOutput,
+        build_stack: BuildStack,
+    ) -> impl Future<Output = Result<Self::SourceDistBuilder, impl IsBuildBackendError>> + 'a;
+
+    /// Build by calling directly into the uv build backend without PEP 517, if possible.
+    ///
+    /// Checks if the source tree uses uv as build backend. If not, it returns `Ok(None)`, otherwise
+    /// it builds and returns the name of the built file.
+    ///
+    /// `version_id` is for error reporting only.
+    fn direct_build<'a>(
+        &'a self,
+        source: &'a Path,
+        subdirectory: Option<&'a Path>,
+        output_dir: &'a Path,
+        sources: SourceStrategy,
+        build_kind: BuildKind,
+        version_id: Option<&'a str>,
+    ) -> impl Future<Output = Result<Option<DistFilename>, impl IsBuildBackendError>> + 'a;
 }
 
 /// A wrapper for `uv_build::SourceBuild` to avoid cyclical crate dependencies.
@@ -112,14 +175,19 @@ pub trait SourceBuildTrait {
     ///
     /// Returns the metadata directory if we're having a PEP 517 build and the
     /// `prepare_metadata_for_build_wheel` hook exists
-    fn metadata(&mut self) -> impl Future<Output = Result<Option<PathBuf>>>;
+    fn metadata(&mut self) -> impl Future<Output = Result<Option<PathBuf>, AnyErrorBuild>>;
 
     /// A wrapper for `uv_build::SourceBuild::build`.
     ///
     /// For PEP 517 builds, this calls `build_wheel`.
     ///
-    /// Returns the filename of the built wheel inside the given `wheel_dir`.
-    fn wheel<'a>(&'a self, wheel_dir: &'a Path) -> impl Future<Output = Result<String>> + 'a;
+    /// Returns the filename of the built wheel inside the given `wheel_dir`. The filename is a
+    /// string and not a `WheelFilename` because the on disk filename might not be normalized in the
+    /// same way as uv would.
+    fn wheel<'a>(
+        &'a self,
+        wheel_dir: &'a Path,
+    ) -> impl Future<Output = Result<String, AnyErrorBuild>> + 'a;
 }
 
 /// A wrapper for [`uv_installer::SitePackages`]
@@ -133,11 +201,89 @@ pub trait InstalledPackagesProvider: Clone + Send + Sync + 'static {
 pub struct EmptyInstalledPackages;
 
 impl InstalledPackagesProvider for EmptyInstalledPackages {
+    fn iter(&self) -> impl Iterator<Item = &InstalledDist> {
+        std::iter::empty()
+    }
+
     fn get_packages(&self, _name: &PackageName) -> Vec<&InstalledDist> {
         Vec::new()
     }
+}
 
-    fn iter(&self) -> impl Iterator<Item = &InstalledDist> {
-        std::iter::empty()
+/// [`anyhow::Error`]-like wrapper type for [`BuildDispatch`] method return values, that also makes
+/// [`IsBuildBackendError`] work as [`thiserror`] `#[source]`.
+///
+/// The errors types have the same problem as [`BuildDispatch`] generally: The `uv-resolver`,
+/// `uv-installer` and `uv-build-frontend` error types all reference each other:
+/// Resolution and installation may need to build packages, while the build frontend needs to
+/// resolve and install for the PEP 517 build environment.
+///
+/// Usually, [`anyhow::Error`] is opaque error type of choice. In this case though, we error type
+/// that we can inspect on whether it's a build backend error with [`IsBuildBackendError`], and
+/// [`anyhow::Error`] does not allow attaching more traits. The next choice would be
+/// `Box<dyn std::error::Error + IsBuildFrontendError + Send + Sync + 'static>`, but [`thiserror`]
+/// complains about the internal `AsDynError` not being implemented when being used as `#[source]`.
+/// This struct is an otherwise transparent error wrapper that thiserror recognizes.
+pub struct AnyErrorBuild(Box<dyn IsBuildBackendError>);
+
+impl Debug for AnyErrorBuild {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self.0, f)
+    }
+}
+
+impl Display for AnyErrorBuild {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for AnyErrorBuild {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+
+    #[allow(deprecated)]
+    fn cause(&self) -> Option<&dyn std::error::Error> {
+        self.0.cause()
+    }
+}
+
+impl<T: IsBuildBackendError> From<T> for AnyErrorBuild {
+    fn from(err: T) -> Self {
+        Self(Box::new(err))
+    }
+}
+
+impl Deref for AnyErrorBuild {
+    type Target = dyn IsBuildBackendError;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+/// The stack of packages being built.
+#[derive(Debug, Clone, Default)]
+pub struct BuildStack(FxHashSet<DistributionId>);
+
+impl BuildStack {
+    /// Return an empty stack.
+    pub fn empty() -> Self {
+        Self(FxHashSet::default())
+    }
+
+    pub fn contains(&self, id: &DistributionId) -> bool {
+        self.0.contains(id)
+    }
+
+    /// Push a package onto the stack.
+    pub fn insert(&mut self, id: DistributionId) -> bool {
+        self.0.insert(id)
     }
 }

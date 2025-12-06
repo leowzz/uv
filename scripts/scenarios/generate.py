@@ -9,7 +9,7 @@ Important:
 
 Requirements:
 
-    $ uv pip install -r scripts/scenarios/requirements.txt
+    $ uv pip install -r scripts/scenarios/pylock.toml
 
     Uses `git`, `rustfmt`, and `cargo insta test` requirements from the project.
 
@@ -27,7 +27,7 @@ Usage:
 
         Override the uv package index and update the tests
 
-        $ UV_TEST_INDEX_URL="http://localhost:3141/simple/" ./scripts/scenarios/generate.py <path to scenarios>
+        $ UV_TEST_PACKSE_INDEX="http://localhost:3141" ./scripts/scenarios/generate.py <path to scenarios>
 
         If an editable version of packse is installed, this script will use its bundled scenarios by default.
 
@@ -41,21 +41,17 @@ import re
 import subprocess
 import sys
 import textwrap
+from enum import StrEnum, auto
 from pathlib import Path
+from typing import Any
 
 TOOL_ROOT = Path(__file__).parent
 TEMPLATES = TOOL_ROOT / "templates"
-INSTALL_TEMPLATE = TEMPLATES / "install.mustache"
-COMPILE_TEMPLATE = TEMPLATES / "compile.mustache"
-LOCK_TEMPLATE = TEMPLATES / "lock.mustache"
 PACKSE = TOOL_ROOT / "packse-scenarios"
-REQUIREMENTS = TOOL_ROOT / "requirements.txt"
+REQUIREMENTS = TOOL_ROOT / "pylock.toml"
 PROJECT_ROOT = TOOL_ROOT.parent.parent
-TESTS = PROJECT_ROOT / "crates" / "uv" / "tests"
-INSTALL_TESTS = TESTS / "pip_install_scenarios.rs"
-COMPILE_TESTS = TESTS / "pip_compile_scenarios.rs"
-LOCK_TESTS = TESTS / "lock_scenarios.rs"
-TESTS_COMMON_MOD_RS = TESTS / "common/mod.rs"
+TESTS = PROJECT_ROOT / "crates" / "uv" / "tests" / "it"
+TESTS_COMMON_MOD_RS = TESTS / "common" / "mod.rs"
 
 try:
     import packse
@@ -77,13 +73,40 @@ except ImportError:
     exit(1)
 
 
-def main(scenarios: list[Path], snapshot_update: bool = True):
+class TemplateKind(StrEnum):
+    install = auto()
+    compile = auto()
+    lock = auto()
+
+    def template_file(self) -> Path:
+        return TEMPLATES / f"{self.name}.mustache"
+
+    def test_file(self) -> Path:
+        match self.value:
+            case TemplateKind.install:
+                return TESTS / "pip_install_scenarios.rs"
+            case TemplateKind.compile:
+                return TESTS / "pip_compile_scenarios.rs"
+            case TemplateKind.lock:
+                return TESTS / "lock_scenarios.rs"
+            case _:
+                raise NotImplementedError()
+
+
+def main(
+    scenarios: list[Path],
+    template_kinds: list[TemplateKind],
+    snapshot_update: bool = True,
+):
     # Fetch packse version
     packse_version = importlib.metadata.version("packse")
 
     debug = logging.getLogger().getEffectiveLevel() <= logging.DEBUG
 
-    update_common_mod_rs(packse_version)
+    # Don't update the version to `0.0.0` to preserve the `UV_TEST_PACKSE_URL`
+    # in local tests.
+    if packse_version != "0.0.0":
+        update_common_mod_rs(packse_version)
 
     if not scenarios:
         if packse_version == "0.0.0":
@@ -93,7 +116,7 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
                     "Detected development version of packse, using scenarios from %s",
                     path,
                 )
-                scenarios = path.glob("*.json")
+                scenarios = [path]
             else:
                 logging.error(
                     "No scenarios provided. Found development version of packse but is missing scenarios. Is it installed as an editable?"
@@ -108,11 +131,12 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
         if target.is_dir():
             targets.extend(target.glob("**/*.json"))
             targets.extend(target.glob("**/*.toml"))
+            targets.extend(target.glob("**/*.yaml"))
         else:
             targets.append(target)
 
     logging.info("Loading scenario metadata...")
-    data = packse.inspect.inspect(
+    data = packse.inspect.variables_for_templates(
         targets=targets,
         no_hash=True,
     )
@@ -124,18 +148,26 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
         if not scenario["name"].startswith("example")
     ]
 
-    # Wrap the description onto multiple lines
+    # We have a mixture of long singe-line descriptions (json scenarios) we need to
+    # wrap and manually formatted markdown in toml and yaml scenarios we want to
+    # preserve.
     for scenario in data["scenarios"]:
-        scenario["description_lines"] = textwrap.wrap(scenario["description"], width=80)
+        if scenario["_textwrap"]:
+            scenario["description"] = textwrap.wrap(scenario["description"], width=80)
+        else:
+            scenario["description"] = scenario["description"].splitlines()
+        # Don't drop empty lines like chevron would.
+        scenario["description"] = "\n/// ".join(scenario["description"])
 
-    # Wrap the expected explanation onto multiple lines
+    # Apply the same wrapping to the expected explanation
     for scenario in data["scenarios"]:
         expected = scenario["expected"]
-        expected["explanation_lines"] = (
-            textwrap.wrap(expected["explanation"], width=80)
-            if expected["explanation"]
-            else []
-        )
+        if explanation := expected["explanation"]:
+            if scenario["_textwrap"]:
+                expected["explanation"] = textwrap.wrap(explanation, width=80)
+            else:
+                expected["explanation"] = explanation.splitlines()
+            expected["explanation"] = "\n// ".join(expected["explanation"])
 
     # Hack to track which scenarios require a specific Python patch version
     for scenario in data["scenarios"]:
@@ -144,21 +176,6 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
         else:
             scenario["python_patch"] = False
 
-    # We don't yet support local versions that aren't expressed as direct dependencies.
-    for scenario in data["scenarios"]:
-        expected = scenario["expected"]
-
-        if scenario["name"] in (
-            "local-less-than-or-equal",
-            "local-simple",
-            "local-transitive-confounding",
-            "local-used-without-sdist",
-        ):
-            expected["satisfiable"] = False
-            expected["explanation"] = (
-                "We do not have correct behavior for local version identifiers yet"
-            )
-
     # Split scenarios into `install`, `compile` and `lock` cases
     install_scenarios = []
     compile_scenarios = []
@@ -166,19 +183,26 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
 
     for scenario in data["scenarios"]:
         resolver_options = scenario["resolver_options"] or {}
+        # Avoid writing the empty `required-environments = []`
+        resolver_options["has_required_environments"] = bool(
+            resolver_options["required_environments"]
+        )
         if resolver_options.get("universal"):
-            print(scenario["name"])
             lock_scenarios.append(scenario)
         elif resolver_options.get("python") is not None:
             compile_scenarios.append(scenario)
         else:
             install_scenarios.append(scenario)
 
-    for template, tests, scenarios in [
-        (INSTALL_TEMPLATE, INSTALL_TESTS, install_scenarios),
-        (COMPILE_TEMPLATE, COMPILE_TESTS, compile_scenarios),
-        (LOCK_TEMPLATE, LOCK_TESTS, lock_scenarios),
-    ]:
+    template_kinds_and_scenarios: list[tuple[TemplateKind, list[Any]]] = [
+        (TemplateKind.install, install_scenarios),
+        (TemplateKind.compile, compile_scenarios),
+        (TemplateKind.lock, lock_scenarios),
+    ]
+    for template_kind, scenarios in template_kinds_and_scenarios:
+        if template_kind not in template_kinds:
+            continue
+
         data = {"scenarios": scenarios}
 
         ref = "HEAD" if packse_version == "0.0.0" else packse_version
@@ -192,22 +216,28 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
             f"https://raw.githubusercontent.com/astral-sh/packse/{ref}/vendor/links.html"
         )
 
-        data["index_url"] = os.environ.get(
-            "UV_TEST_INDEX_URL",
-            f"https://astral-sh.github.io/packse/{ref}/simple-html/",
+        data["index_url"] = (
+            os.environ.get(
+                "UV_TEST_PACKSE_INDEX",
+                f"https://astral-sh.github.io/packse/{ref}",
+            )
+            + "/simple-html"
         )
 
         # Render the template
-        logging.info(f"Rendering template {template.name}")
+        logging.info(f"Rendering template {template_kind.name}")
         output = chevron_blue.render(
-            template=template.read_text(), data=data, no_escape=True, warn=True
+            template=template_kind.template_file().read_text(),
+            data=data,
+            no_escape=True,
+            warn=True,
         )
 
         # Update the test files
         logging.info(
-            f"Updating test file at `{tests.relative_to(PROJECT_ROOT)}`...",
+            f"Updating test file at `{template_kind.test_file().relative_to(PROJECT_ROOT)}`...",
         )
-        with open(tests, "w") as test_file:
+        with open(template_kind.test_file(), "w") as test_file:
             test_file.write(output)
 
         # Format
@@ -215,7 +245,7 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
             "Formatting test file...",
         )
         subprocess.check_call(
-            ["rustfmt", str(tests)],
+            ["rustfmt", template_kind.test_file()],
             stderr=subprocess.STDOUT,
             stdout=sys.stderr if debug else subprocess.DEVNULL,
         )
@@ -224,25 +254,32 @@ def main(scenarios: list[Path], snapshot_update: bool = True):
         if snapshot_update:
             logging.info("Updating snapshots...")
             env = os.environ.copy()
-            env["UV_TEST_PYTHON_PATH"] = str(PROJECT_ROOT / "bin")
-            subprocess.call(
-                [
-                    "cargo",
-                    "insta",
-                    "test",
-                    "--features",
-                    "pypi,python,python-patch",
-                    "--accept",
-                    "--test-runner",
-                    "nextest",
-                    "--test",
-                    tests.with_suffix("").name,
-                ],
+            command = [
+                "cargo",
+                "insta",
+                "test",
+                "--features",
+                "pypi,python,python-patch",
+                "--accept",
+                "--test-runner",
+                "nextest",
+                "--test",
+                "it",
+                "--",
+                template_kind.test_file().with_suffix("").name,
+            ]
+            logging.debug(f"Running {' '.join(command)}")
+            exit_code = subprocess.call(
+                command,
                 cwd=PROJECT_ROOT,
                 stderr=subprocess.STDOUT,
                 stdout=sys.stderr if debug else subprocess.DEVNULL,
                 env=env,
             )
+            if exit_code != 0:
+                logging.warning(
+                    f"Snapshot update failed with exit code {exit_code} (use -v to show details)"
+                )
         else:
             logging.info("Skipping snapshot update")
 
@@ -268,9 +305,9 @@ def update_common_mod_rs(packse_version: str):
         url_matcher = re.compile(
             re.escape(before_version) + '[^"]+' + re.escape(after_version)
         )
-        assert (
-            len(url_matcher.findall(test_common)) == 1
-        ), f"PACKSE_VERSION not found in {TESTS_COMMON_MOD_RS}"
+        assert len(url_matcher.findall(test_common)) == 1, (
+            f"PACKSE_VERSION not found in {TESTS_COMMON_MOD_RS}"
+        )
         test_common = url_matcher.sub(build_vendor_links_url, test_common)
         TESTS_COMMON_MOD_RS.write_text(test_common)
 
@@ -284,6 +321,14 @@ if __name__ == "__main__":
         type=Path,
         nargs="*",
         help="The scenario files to use",
+    )
+    parser.add_argument(
+        "--templates",
+        type=TemplateKind,
+        choices=list(TemplateKind),
+        default=list(TemplateKind),
+        nargs="*",
+        help="The templates to render. By default, all templates are rendered",
     )
     parser.add_argument(
         "-v",
@@ -314,4 +359,4 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=log_level, format="%(message)s")
 
-    main(args.scenarios, snapshot_update=not args.no_snapshot_update)
+    main(args.scenarios, args.templates, snapshot_update=not args.no_snapshot_update)

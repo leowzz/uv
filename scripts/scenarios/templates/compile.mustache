@@ -13,9 +13,12 @@ use assert_cmd::assert::OutputAssertExt;
 use assert_fs::fixture::{FileWriteStr, PathChild};
 use predicates::prelude::predicate;
 
-use common::{build_vendor_links_url, packse_index_url, python_path_with_versions, get_bin, uv_snapshot, TestContext};
+use uv_static::EnvVars;
 
-mod common;
+use crate::common::{
+    TestContext, build_vendor_links_url, get_bin, packse_index_url, python_path_with_versions,
+    uv_snapshot,
+};
 
 /// Provision python binaries and return a `pip compile` command with options shared across all scenarios.
 fn command(context: &TestContext, python_versions: &[&str]) -> Command {
@@ -30,18 +33,16 @@ fn command(context: &TestContext, python_versions: &[&str]) -> Command {
         .arg(packse_index_url())
         .arg("--find-links")
         .arg(build_vendor_links_url());
-    context.add_shared_args(&mut command);
-    command.env_remove("UV_EXCLUDE_NEWER");
-    command.env("UV_TEST_PYTHON_PATH", python_path);
+    context.add_shared_options(&mut command, true);
+    command.env_remove(EnvVars::UV_EXCLUDE_NEWER);
+    command.env(EnvVars::UV_TEST_PYTHON_PATH, python_path);
 
     command
 }
 
 {{#scenarios}}
 
-{{#description_lines}}
-/// {{.}}
-{{/description_lines}}
+/// {{description}}
 ///
 /// ```text
 /// {{name}}
@@ -66,9 +67,9 @@ fn {{module_name}}() -> Result<()> {
     requirements_in.write_str("{{requirement}}")?;
     {{/root.requires}}
 
-    {{#expected.explanation_lines}}
-    // {{.}}
-    {{/expected.explanation_lines}}
+    {{#expected.explanation}}
+    // {{expected.explanation}}
+    {{/expected.explanation}}
     let output = uv_snapshot!(filters, command(&context, python_versions)
         {{#resolver_options.prereleases}}
         .arg("--prerelease=allow")

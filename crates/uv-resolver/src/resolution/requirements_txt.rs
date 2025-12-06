@@ -4,25 +4,28 @@ use std::path::Path;
 
 use itertools::Itertools;
 
-use distribution_types::{DistributionMetadata, Name, ResolvedDist, Verbatim, VersionOrUrlRef};
-use pep440_rs::Version;
-use pep508_rs::{split_scheme, MarkerTree, Scheme};
-use pypi_types::HashDigest;
+use uv_distribution_types::{
+    DistributionMetadata, Name, RequiresPython, ResolvedDist, SimplifiedMarkerTree, Verbatim,
+    VersionOrUrlRef,
+};
 use uv_normalize::{ExtraName, PackageName};
+use uv_pep440::Version;
+use uv_pep508::{MarkerTree, Scheme, split_scheme};
+use uv_pypi_types::HashDigest;
 
 use crate::resolution::AnnotatedDist;
 
 #[derive(Debug, Clone)]
 /// A pinned package with its resolved distribution and all the extras that were pinned for it.
-pub(crate) struct RequirementsTxtDist {
-    pub(crate) dist: ResolvedDist,
-    pub(crate) version: Version,
+pub(crate) struct RequirementsTxtDist<'dist> {
+    pub(crate) dist: &'dist ResolvedDist,
+    pub(crate) version: &'dist Version,
+    pub(crate) hashes: &'dist [HashDigest],
+    pub(crate) markers: MarkerTree,
     pub(crate) extras: Vec<ExtraName>,
-    pub(crate) hashes: Vec<HashDigest>,
-    pub(crate) markers: Option<MarkerTree>,
 }
 
-impl RequirementsTxtDist {
+impl<'dist> RequirementsTxtDist<'dist> {
     /// Convert the [`RequirementsTxtDist`] to a requirement that adheres to the `requirements.txt`
     /// format.
     ///
@@ -31,9 +34,9 @@ impl RequirementsTxtDist {
     /// supported in `requirements.txt`).
     pub(crate) fn to_requirements_txt(
         &self,
-        include_extras: bool,
+        requires_python: &RequiresPython,
         include_markers: bool,
-    ) -> Cow<str> {
+    ) -> Cow<'_, str> {
         // If the URL is editable, write it as an editable requirement.
         if self.dist.is_editable() {
             if let VersionOrUrlRef::Url(url) = self.dist.version_or_url() {
@@ -42,7 +45,7 @@ impl RequirementsTxtDist {
             }
         }
 
-        // If the URL is not _definitively_ an absolute `file://` URL, write it as a relative path.
+        // If the URL is not _definitively_ a `file://` URL, write it as a relative path.
         if self.dist.is_local() {
             if let VersionOrUrlRef::Url(url) = self.dist.version_or_url() {
                 let given = url.verbatim();
@@ -69,11 +72,12 @@ impl RequirementsTxtDist {
                                     {
                                         Some(Cow::Owned(path.to_string()))
                                     } else {
+                                        // Ex) `file:///flask-3.0.3-py3-none-any.whl`
                                         None
                                     }
                                 } else {
                                     // Ex) `file:./flask-3.0.3-py3-none-any.whl`
-                                    Some(given)
+                                    None
                                 }
                             }
                             Some(_) => None,
@@ -89,7 +93,10 @@ impl RequirementsTxtDist {
                     }
                 };
                 if let Some(given) = given {
-                    return if let Some(markers) = self.markers.as_ref().filter(|_| include_markers)
+                    return if let Some(markers) =
+                        SimplifiedMarkerTree::new(requires_python, self.markers)
+                            .try_to_string()
+                            .filter(|_| include_markers)
                     {
                         Cow::Owned(format!("{given} ; {markers}"))
                     } else {
@@ -99,8 +106,11 @@ impl RequirementsTxtDist {
             }
         }
 
-        if self.extras.is_empty() || !include_extras {
-            if let Some(markers) = self.markers.as_ref().filter(|_| include_markers) {
+        if self.extras.is_empty() {
+            if let Some(markers) = SimplifiedMarkerTree::new(requires_python, self.markers)
+                .try_to_string()
+                .filter(|_| include_markers)
+            {
                 Cow::Owned(format!("{} ; {}", self.dist.verbatim(), markers))
             } else {
                 self.dist.verbatim()
@@ -109,7 +119,10 @@ impl RequirementsTxtDist {
             let mut extras = self.extras.clone();
             extras.sort_unstable();
             extras.dedup();
-            if let Some(markers) = self.markers.as_ref().filter(|_| include_markers) {
+            if let Some(markers) = SimplifiedMarkerTree::new(requires_python, self.markers)
+                .try_to_string()
+                .filter(|_| include_markers)
+            {
                 Cow::Owned(format!(
                     "{}[{}]{} ; {}",
                     self.name(),
@@ -128,7 +141,9 @@ impl RequirementsTxtDist {
         }
     }
 
-    pub(crate) fn to_comparator(&self) -> RequirementsTxtComparator {
+    /// Convert the [`RequirementsTxtDist`] to a comparator that can be used to sort the requirements
+    /// in a `requirements.txt` file.
+    pub(crate) fn to_comparator(&self) -> RequirementsTxtComparator<'_> {
         if self.dist.is_editable() {
             if let VersionOrUrlRef::Url(url) = self.dist.version_or_url() {
                 return RequirementsTxtComparator::Url(url.verbatim());
@@ -138,37 +153,48 @@ impl RequirementsTxtDist {
         if let VersionOrUrlRef::Url(url) = self.version_or_url() {
             RequirementsTxtComparator::Name {
                 name: self.name(),
-                version: &self.version,
+                version: self.version,
                 url: Some(url.verbatim()),
+                extras: &self.extras,
             }
         } else {
             RequirementsTxtComparator::Name {
                 name: self.name(),
-                version: &self.version,
+                version: self.version,
                 url: None,
+                extras: &self.extras,
             }
         }
     }
-}
 
-impl From<&AnnotatedDist> for RequirementsTxtDist {
-    fn from(annotated: &AnnotatedDist) -> Self {
+    pub(crate) fn from_annotated_dist(annotated: &'dist AnnotatedDist) -> Self {
+        assert!(
+            annotated.marker.conflict().is_true(),
+            "found dist {annotated} with non-trivial conflicting marker {marker:?}, \
+             which cannot be represented in a `requirements.txt` format",
+            marker = annotated.marker,
+        );
         Self {
-            dist: annotated.dist.clone(),
-            version: annotated.version.clone(),
+            dist: &annotated.dist,
+            version: &annotated.version,
+            hashes: annotated.hashes.as_slice(),
+            // OK because we've asserted above that this dist
+            // does not have a non-trivial conflicting marker
+            // that we would otherwise need to care about.
+            markers: annotated.marker.combined(),
             extras: if let Some(extra) = annotated.extra.clone() {
                 vec![extra]
             } else {
                 vec![]
             },
-            hashes: annotated.hashes.clone(),
-            markers: None,
         }
     }
 }
 
+/// A comparator for sorting requirements in a `requirements.txt` file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RequirementsTxtComparator<'a> {
+    /// Sort by URL for editable requirements.
     Url(Cow<'a, str>),
     /// In universal mode, we can have multiple versions for a package, so we track the version and
     /// the URL (for non-index packages) to have a stable sort for those, too.
@@ -176,22 +202,23 @@ pub(crate) enum RequirementsTxtComparator<'a> {
         name: &'a PackageName,
         version: &'a Version,
         url: Option<Cow<'a, str>>,
+        extras: &'a [ExtraName],
     },
 }
 
-impl Name for RequirementsTxtDist {
+impl Name for RequirementsTxtDist<'_> {
     fn name(&self) -> &PackageName {
         self.dist.name()
     }
 }
 
-impl DistributionMetadata for RequirementsTxtDist {
-    fn version_or_url(&self) -> VersionOrUrlRef {
+impl DistributionMetadata for RequirementsTxtDist<'_> {
+    fn version_or_url(&self) -> VersionOrUrlRef<'_> {
         self.dist.version_or_url()
     }
 }
 
-impl Display for RequirementsTxtDist {
+impl Display for RequirementsTxtDist<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.dist, f)
     }

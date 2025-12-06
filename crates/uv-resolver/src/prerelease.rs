@@ -1,12 +1,11 @@
-use pypi_types::RequirementSource;
-
-use pep508_rs::MarkerEnvironment;
+use uv_distribution_types::RequirementSource;
 use uv_normalize::PackageName;
+use uv_pep440::Operator;
 
 use crate::resolver::ForkSet;
-use crate::{DependencyMode, Manifest, ResolverMarkers};
+use crate::{DependencyMode, Manifest, ResolverEnvironment};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -68,7 +67,7 @@ impl PrereleaseStrategy {
     pub(crate) fn from_mode(
         mode: PrereleaseMode,
         manifest: &Manifest,
-        markers: Option<&MarkerEnvironment>,
+        env: &ResolverEnvironment,
         dependencies: DependencyMode,
     ) -> Self {
         let mut packages = ForkSet::default();
@@ -78,14 +77,17 @@ impl PrereleaseStrategy {
             PrereleaseMode::Allow => Self::Allow,
             PrereleaseMode::IfNecessary => Self::IfNecessary,
             _ => {
-                for requirement in manifest.requirements(markers, dependencies) {
+                for requirement in manifest.requirements(env, dependencies) {
                     let RequirementSource::Registry { specifier, .. } = &requirement.source else {
                         continue;
                     };
 
                     if specifier
                         .iter()
-                        .any(pep440_rs::VersionSpecifier::any_prerelease)
+                        .filter(|spec| {
+                            !matches!(spec.operator(), Operator::NotEqual | Operator::NotEqualStar)
+                        })
+                        .any(uv_pep440::VersionSpecifier::any_prerelease)
                     {
                         packages.add(&requirement, ());
                     }
@@ -104,21 +106,21 @@ impl PrereleaseStrategy {
     pub(crate) fn allows(
         &self,
         package_name: &PackageName,
-        markers: &ResolverMarkers,
+        env: &ResolverEnvironment,
     ) -> AllowPrerelease {
         match self {
-            PrereleaseStrategy::Disallow => AllowPrerelease::No,
-            PrereleaseStrategy::Allow => AllowPrerelease::Yes,
-            PrereleaseStrategy::IfNecessary => AllowPrerelease::IfNecessary,
-            PrereleaseStrategy::Explicit(packages) => {
-                if packages.contains(package_name, markers) {
+            Self::Disallow => AllowPrerelease::No,
+            Self::Allow => AllowPrerelease::Yes,
+            Self::IfNecessary => AllowPrerelease::IfNecessary,
+            Self::Explicit(packages) => {
+                if packages.contains(package_name, env) {
                     AllowPrerelease::Yes
                 } else {
                     AllowPrerelease::No
                 }
             }
-            PrereleaseStrategy::IfNecessaryOrExplicit(packages) => {
-                if packages.contains(package_name, markers) {
+            Self::IfNecessaryOrExplicit(packages) => {
+                if packages.contains(package_name, env) {
                     AllowPrerelease::Yes
                 } else {
                     AllowPrerelease::IfNecessary

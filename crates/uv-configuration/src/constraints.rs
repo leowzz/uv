@@ -3,9 +3,9 @@ use std::borrow::Cow;
 use either::Either;
 use rustc_hash::FxHashMap;
 
-use pep508_rs::MarkerTree;
-use pypi_types::{Requirement, RequirementSource};
+use uv_distribution_types::{Requirement, RequirementSource};
 use uv_normalize::PackageName;
+use uv_pep508::MarkerTree;
 
 /// A set of constraints for a set of requirements.
 #[derive(Debug, Default, Clone)]
@@ -28,7 +28,7 @@ impl Constraints {
                 .or_default()
                 .push(Requirement {
                     // We add and apply constraints independent of their extras.
-                    extras: vec![],
+                    extras: Box::new([]),
                     ..requirement
                 });
         }
@@ -60,12 +60,7 @@ impl Constraints {
 
             // ASSUMPTION: There is one `extra = "..."`, and it's either the only marker or part
             // of the main conjunction.
-            let Some(extra_expression) = requirement
-                .marker
-                .as_ref()
-                .and_then(|marker| marker.top_level_extra())
-                .cloned()
-            else {
+            let Some(extra_expression) = requirement.marker.top_level_extra() else {
                 // Case 2: A non-optional dependency with constraint(s).
                 return Either::Right(Either::Right(
                     std::iter::once(requirement).chain(constraints.iter().map(Cow::Borrowed)),
@@ -79,12 +74,10 @@ impl Constraints {
             Either::Right(Either::Left(std::iter::once(requirement).chain(
                 constraints.iter().cloned().map(move |constraint| {
                     // Add the extra to the override marker.
-                    let mut joint_marker = MarkerTree::Expression(extra_expression.clone());
-                    if let Some(marker) = &constraint.marker {
-                        joint_marker.and(marker.clone());
-                    }
+                    let mut joint_marker = MarkerTree::expression(extra_expression.clone());
+                    joint_marker.and(constraint.marker);
                     Cow::Owned(Requirement {
-                        marker: Some(joint_marker.clone()),
+                        marker: joint_marker,
                         ..constraint
                     })
                 }),

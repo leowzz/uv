@@ -1,26 +1,28 @@
 use std::str::FromStr;
 
+use jiff::Timestamp;
 use tl::HTMLTag;
-use tracing::instrument;
-use url::Url;
+use tracing::{debug, instrument, warn};
 
-use pep440_rs::VersionSpecifiers;
-use pypi_types::LenientVersionSpecifiers;
-use pypi_types::{BaseUrl, CoreMetadata, File, Hashes, Yanked};
+use uv_normalize::PackageName;
+use uv_pep440::VersionSpecifiers;
+use uv_pypi_types::{BaseUrl, CoreMetadata, Hashes, PypiFile, Yanked};
+use uv_pypi_types::{HashError, LenientVersionSpecifiers};
+use uv_redacted::{DisplaySafeUrl, DisplaySafeUrlError};
 
 /// A parsed structure from PyPI "HTML" index format for a single package.
 #[derive(Debug, Clone)]
-pub(crate) struct SimpleHtml {
+pub(crate) struct SimpleDetailHTML {
     /// The [`BaseUrl`] to which all relative URLs should be resolved.
     pub(crate) base: BaseUrl,
-    /// The list of [`File`]s available for download sorted by filename.
-    pub(crate) files: Vec<File>,
+    /// The list of [`PypiFile`]s available for download sorted by filename.
+    pub(crate) files: Vec<PypiFile>,
 }
 
-impl SimpleHtml {
-    /// Parse the list of [`File`]s from the simple HTML page returned by the given URL.
+impl SimpleDetailHTML {
+    /// Parse the list of [`PypiFile`]s from the simple HTML page returned by the given URL.
     #[instrument(skip_all, fields(url = % url))]
-    pub(crate) fn parse(text: &str, url: &Url) -> Result<Self, Error> {
+    pub(crate) fn parse(text: &str, url: &DisplaySafeUrl) -> Result<Self, Error> {
         let dom = tl::parse(text, tl::ParserOptions::default())?;
 
         // Parse the first `<base>` tag, if any, to determine the base URL to which all
@@ -39,12 +41,17 @@ impl SimpleHtml {
         );
 
         // Parse each `<a>` tag, to extract the filename, hash, and URL.
-        let mut files: Vec<File> = dom
+        let mut files: Vec<PypiFile> = dom
             .nodes()
             .iter()
             .filter_map(|node| node.as_tag())
             .filter(|link| link.name().as_bytes() == b"a")
             .map(|link| Self::parse_anchor(link))
+            .filter_map(|result| match result {
+                Ok(None) => None,
+                Ok(Some(file)) => Some(Ok(file)),
+                Err(err) => Some(Err(err)),
+            })
             .collect::<Result<Vec<_>, _>>()?;
         // While it has not been positively observed, we sort the files
         // to ensure we have a defined ordering. Otherwise, if we rely on
@@ -60,99 +67,61 @@ impl SimpleHtml {
     }
 
     /// Parse the `href` from a `<base>` tag.
-    fn parse_base(base: &HTMLTag) -> Result<Option<Url>, Error> {
+    fn parse_base(base: &HTMLTag) -> Result<Option<DisplaySafeUrl>, Error> {
         let Some(Some(href)) = base.attributes().get("href") else {
             return Ok(None);
         };
         let href = std::str::from_utf8(href.as_bytes())?;
-        let url = Url::parse(href).map_err(|err| Error::UrlParse(href.to_string(), err))?;
+        let url =
+            DisplaySafeUrl::parse(href).map_err(|err| Error::UrlParse(href.to_string(), err))?;
         Ok(Some(url))
     }
 
-    /// Parse the hash from a fragment, as in: `sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61`
-    fn parse_hash(fragment: &str) -> Result<Hashes, Error> {
-        let mut parts = fragment.split('=');
-
-        // Extract the key and value.
-        let name = parts
-            .next()
-            .ok_or_else(|| Error::FragmentParse(fragment.to_string()))?;
-        let value = parts
-            .next()
-            .ok_or_else(|| Error::FragmentParse(fragment.to_string()))?;
-
-        // Ensure there are no more parts.
-        if parts.next().is_some() {
-            return Err(Error::FragmentParse(fragment.to_string()));
-        }
-
-        match name {
-            "md5" => {
-                let md5 = std::str::from_utf8(value.as_bytes())?;
-                let md5 = md5.to_owned().into_boxed_str();
-                Ok(Hashes {
-                    md5: Some(md5),
-                    sha256: None,
-                    sha384: None,
-                    sha512: None,
-                })
-            }
-            "sha256" => {
-                let sha256 = std::str::from_utf8(value.as_bytes())?;
-                let sha256 = sha256.to_owned().into_boxed_str();
-                Ok(Hashes {
-                    md5: None,
-                    sha256: Some(sha256),
-                    sha384: None,
-                    sha512: None,
-                })
-            }
-            "sha384" => {
-                let sha384 = std::str::from_utf8(value.as_bytes())?;
-                let sha384 = sha384.to_owned().into_boxed_str();
-                Ok(Hashes {
-                    md5: None,
-                    sha256: None,
-                    sha384: Some(sha384),
-                    sha512: None,
-                })
-            }
-            "sha512" => {
-                let sha512 = std::str::from_utf8(value.as_bytes())?;
-                let sha512 = sha512.to_owned().into_boxed_str();
-                Ok(Hashes {
-                    md5: None,
-                    sha256: None,
-                    sha384: None,
-                    sha512: Some(sha512),
-                })
-            }
-            _ => Err(Error::UnsupportedHashAlgorithm(fragment.to_string())),
-        }
-    }
-
-    /// Parse a [`File`] from an `<a>` tag.
-    fn parse_anchor(link: &HTMLTag) -> Result<File, Error> {
+    /// Parse a [`PypiFile`] from an `<a>` tag.
+    ///
+    /// Returns `None` if the `<a>` doesn't have an `href` attribute.
+    fn parse_anchor(link: &HTMLTag) -> Result<Option<PypiFile>, Error> {
         // Extract the href.
-        let href = link
+        let Some(href) = link
             .attributes()
             .get("href")
             .flatten()
             .filter(|bytes| !bytes.as_bytes().is_empty())
-            .ok_or(Error::MissingHref)?;
+        else {
+            return Ok(None);
+        };
         let href = std::str::from_utf8(href.as_bytes())?;
 
         // Extract the hash, which should be in the fragment.
         let decoded = html_escape::decode_html_entities(href);
         let (path, hashes) = if let Some((path, fragment)) = decoded.split_once('#') {
-            let fragment = urlencoding::decode(fragment)
-                .map_err(|_| Error::FragmentParse(fragment.to_string()))?;
+            let fragment = percent_encoding::percent_decode_str(fragment).decode_utf8()?;
             (
                 path,
                 if fragment.trim().is_empty() {
                     Hashes::default()
                 } else {
-                    Self::parse_hash(&fragment)?
+                    match Hashes::parse_fragment(&fragment) {
+                        Ok(hashes) => hashes,
+                        Err(
+                            err
+                            @ (HashError::InvalidFragment(..) | HashError::InvalidStructure(..)),
+                        ) => {
+                            // If the URL includes an irrelevant hash (e.g., `#main`), ignore it.
+                            debug!("{err}");
+                            Hashes::default()
+                        }
+                        Err(HashError::UnsupportedHashAlgorithm(fragment)) => {
+                            if fragment == "egg" {
+                                // If the URL references an egg hash, ignore it.
+                                debug!("{}", HashError::UnsupportedHashAlgorithm(fragment));
+                                Hashes::default()
+                            } else {
+                                // If the URL references a hash, but it's unsupported, error.
+                                return Err(HashError::UnsupportedHashAlgorithm(fragment).into());
+                            }
+                        }
+                    }
                 },
             )
         } else {
@@ -163,14 +132,15 @@ impl SimpleHtml {
         // the final path component of the URL.
         let filename = path
             .split('/')
-            .last()
+            .next_back()
             .ok_or_else(|| Error::MissingFilename(href.to_string()))?;
 
         // Strip any query string from the filename.
         let filename = filename.split('?').next().unwrap_or(filename);
 
         // Unquote the filename.
-        let filename = urlencoding::decode(filename)
+        let filename = percent_encoding::percent_decode_str(filename)
+            .decode_utf8()
             .map_err(|_| Error::UnsupportedFilename(filename.to_string()))?;
 
         // Extract the `requires-python` value, which should be set on the
@@ -199,7 +169,13 @@ impl SimpleHtml {
             match dist_info_metadata.as_ref() {
                 "true" => Some(CoreMetadata::Bool(true)),
                 "false" => Some(CoreMetadata::Bool(false)),
-                fragment => Some(CoreMetadata::Hashes(Self::parse_hash(fragment)?)),
+                fragment => match Hashes::parse_fragment(fragment) {
+                    Ok(hash) => Some(CoreMetadata::Hashes(hash)),
+                    Err(err) => {
+                        warn!("Failed to parse core metadata value `{fragment}`: {err}");
+                        None
+                    }
+                },
             }
         } else {
             None
@@ -210,23 +186,93 @@ impl SimpleHtml {
         let yanked = if let Some(yanked) = link.attributes().get("data-yanked").flatten() {
             let yanked = std::str::from_utf8(yanked.as_bytes())?;
             let yanked = html_escape::decode_html_entities(yanked);
-            Some(Yanked::Reason(yanked.to_string()))
+            Some(Box::new(Yanked::Reason(yanked.into())))
         } else {
             None
         };
 
-        Ok(File {
+        // Extract the `size` field, which should be set on the `data-size` attribute. This isn't
+        // included in PEP 700, which omits the HTML API, but we respect it anyway. Since this
+        // field isn't standardized, we discard errors.
+        let size = link
+            .attributes()
+            .get("data-size")
+            .flatten()
+            .and_then(|size| std::str::from_utf8(size.as_bytes()).ok())
+            .map(|size| html_escape::decode_html_entities(size))
+            .and_then(|size| size.parse().ok());
+
+        // Extract the `upload-time` field, which should be set on the `data-upload-time` attribute. This isn't
+        // included in PEP 700, which omits the HTML API, but we respect it anyway. Since this
+        // field isn't standardized, we discard errors.
+        let upload_time = link
+            .attributes()
+            .get("data-upload-time")
+            .flatten()
+            .and_then(|upload_time| std::str::from_utf8(upload_time.as_bytes()).ok())
+            .map(|upload_time| html_escape::decode_html_entities(upload_time))
+            .and_then(|upload_time| Timestamp::from_str(&upload_time).ok());
+
+        Ok(Some(PypiFile {
             core_metadata,
-            dist_info_metadata: None,
-            data_dist_info_metadata: None,
             yanked,
             requires_python,
             hashes,
-            filename: filename.to_string(),
-            url: decoded.to_string(),
-            size: None,
-            upload_time: None,
-        })
+            filename: filename.into(),
+            url: path.into(),
+            size,
+            upload_time,
+        }))
+    }
+}
+
+/// A parsed structure from PyPI "HTML" index format listing all available packages.
+#[derive(Debug, Clone)]
+pub(crate) struct SimpleIndexHtml {
+    /// The list of project names available in the index.
+    pub(crate) projects: Vec<PackageName>,
+}
+
+impl SimpleIndexHtml {
+    /// Parse the list of project names from the Simple API index HTML page.
+    pub(crate) fn parse(text: &str) -> Result<Self, Error> {
+        let dom = tl::parse(text, tl::ParserOptions::default())?;
+
+        // Parse each `<a>` tag to extract the project name.
+        let parser = dom.parser();
+        let mut projects = dom
+            .nodes()
+            .iter()
+            .filter_map(|node| node.as_tag())
+            .filter(|link| link.name().as_bytes() == b"a")
+            .filter_map(|link| Self::parse_anchor_project_name(link, parser))
+            .collect::<Vec<_>>();
+
+        // Sort for deterministic ordering.
+        projects.sort_unstable();
+
+        Ok(Self { projects })
+    }
+
+    /// Parse a project name from an `<a>` tag.
+    ///
+    /// Returns `None` if the `<a>` doesn't have an `href` attribute or text content.
+    fn parse_anchor_project_name(link: &HTMLTag, parser: &tl::Parser) -> Option<PackageName> {
+        // Extract the href.
+        link.attributes()
+            .get("href")
+            .flatten()
+            .filter(|bytes| !bytes.as_bytes().is_empty())?;
+
+        // Extract the text content, which should be the project name.
+        let inner_text = link.inner_text(parser);
+        let project_name = inner_text.trim();
+
+        if project_name.is_empty() {
+            return None;
+        }
+
+        PackageName::from_str(project_name).ok()
     }
 }
 
@@ -235,14 +281,17 @@ pub enum Error {
     #[error(transparent)]
     Utf8(#[from] std::str::Utf8Error),
 
+    #[error(transparent)]
+    FromUtf8(#[from] std::string::FromUtf8Error),
+
     #[error("Failed to parse URL: {0}")]
-    UrlParse(String, #[source] url::ParseError),
+    UrlParse(String, #[source] DisplaySafeUrlError),
 
     #[error(transparent)]
     HtmlParse(#[from] tl::ParseError),
 
-    #[error("Missing href attribute on anchor link")]
-    MissingHref,
+    #[error("Missing href attribute on anchor link: `{0}`")]
+    MissingHref(String),
 
     #[error("Expected distribution filename as last path component of URL: {0}")]
     MissingFilename(String),
@@ -253,16 +302,11 @@ pub enum Error {
     #[error("Missing hash attribute on URL: {0}")]
     MissingHash(String),
 
-    #[error("Unexpected fragment (expected `#sha256=...` or similar) on URL: {0}")]
-    FragmentParse(String),
-
-    #[error(
-        "Unsupported hash algorithm (expected `md5`, `sha256`, `sha384`, or `sha512`) on: {0}"
-    )]
-    UnsupportedHashAlgorithm(String),
+    #[error(transparent)]
+    FragmentParse(#[from] HashError),
 
     #[error("Invalid `requires-python` specifier: {0}")]
-    Pep440(#[source] pep440_rs::VersionSpecifiersParseError),
+    Pep440(#[source] uv_pep440::VersionSpecifiersParseError),
 }
 
 #[cfg(test)]
@@ -274,19 +318,19 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -303,10 +347,8 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.2-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
@@ -315,16 +357,17 @@ mod tests {
                         ),
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
                     upload_time: None,
-                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61",
+                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
                     yanked: None,
                 },
             ],
         }
-        "###);
+        "#);
     }
 
     #[test]
@@ -332,19 +375,19 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl#md5=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#md5=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -361,10 +404,8 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.2-py3-none-any.whl",
                     hashes: Hashes {
                         md5: Some(
@@ -373,16 +414,17 @@ mod tests {
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
                     upload_time: None,
-                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl#md5=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61",
+                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
                     yanked: None,
                 },
             ],
         }
-        "###);
+        "#);
     }
 
     #[test]
@@ -390,22 +432,22 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <head>
-    <base href="https://index.python.org/">
-  </head>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<head>
+<base href="https://index.python.org/">
+</head>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -422,10 +464,8 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.2-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
@@ -434,234 +474,7 @@ mod tests {
                         ),
                         sha384: None,
                         sha512: None,
-                    },
-                    requires_python: None,
-                    size: None,
-                    upload_time: None,
-                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61",
-                    yanked: None,
-                },
-            ],
-        }
-        "###);
-    }
-
-    #[test]
-    fn parse_escaped_fragment() {
-        let text = r#"
-<!DOCTYPE html>
-<html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2&#43;233fca715f49-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2+233fca715f49-py3-none-any.whl</a><br/>
-  </body>
-</html>
-<!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
-            base: BaseUrl(
-                Url {
-                    scheme: "https",
-                    cannot_be_a_base: false,
-                    username: "",
-                    password: None,
-                    host: Some(
-                        Domain(
-                            "download.pytorch.org",
-                        ),
-                    ),
-                    port: None,
-                    path: "/whl/jinja2/",
-                    query: None,
-                    fragment: None,
-                },
-            ),
-            files: [
-                File {
-                    core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
-                    filename: "Jinja2-3.1.2+233fca715f49-py3-none-any.whl",
-                    hashes: Hashes {
-                        md5: None,
-                        sha256: Some(
-                            "6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61",
-                        ),
-                        sha384: None,
-                        sha512: None,
-                    },
-                    requires_python: None,
-                    size: None,
-                    upload_time: None,
-                    url: "/whl/Jinja2-3.1.2+233fca715f49-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61",
-                    yanked: None,
-                },
-            ],
-        }
-        "###);
-    }
-
-    #[test]
-    fn parse_encoded_fragment() {
-        let text = r#"
-<!DOCTYPE html>
-<html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256%3D4095ada29e51070f7d199a0a5bdf5c8d8e238e03f0bf4dcc02571e78c9ae800d">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
-</html>
-<!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
-            base: BaseUrl(
-                Url {
-                    scheme: "https",
-                    cannot_be_a_base: false,
-                    username: "",
-                    password: None,
-                    host: Some(
-                        Domain(
-                            "download.pytorch.org",
-                        ),
-                    ),
-                    port: None,
-                    path: "/whl/jinja2/",
-                    query: None,
-                    fragment: None,
-                },
-            ),
-            files: [
-                File {
-                    core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
-                    filename: "Jinja2-3.1.2-py3-none-any.whl",
-                    hashes: Hashes {
-                        md5: None,
-                        sha256: Some(
-                            "4095ada29e51070f7d199a0a5bdf5c8d8e238e03f0bf4dcc02571e78c9ae800d",
-                        ),
-                        sha384: None,
-                        sha512: None,
-                    },
-                    requires_python: None,
-                    size: None,
-                    upload_time: None,
-                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl#sha256%3D4095ada29e51070f7d199a0a5bdf5c8d8e238e03f0bf4dcc02571e78c9ae800d",
-                    yanked: None,
-                },
-            ],
-        }
-        "###);
-    }
-
-    #[test]
-    fn parse_quoted_filepath() {
-        let text = r#"
-<!DOCTYPE html>
-<html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="cpu/torchtext-0.17.0%2Bcpu-cp39-cp39-win_amd64.whl">cpu/torchtext-0.17.0%2Bcpu-cp39-cp39-win_amd64.whl</a><br/>
-  </body>
-</html>
-<!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
-            base: BaseUrl(
-                Url {
-                    scheme: "https",
-                    cannot_be_a_base: false,
-                    username: "",
-                    password: None,
-                    host: Some(
-                        Domain(
-                            "download.pytorch.org",
-                        ),
-                    ),
-                    port: None,
-                    path: "/whl/jinja2/",
-                    query: None,
-                    fragment: None,
-                },
-            ),
-            files: [
-                File {
-                    core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
-                    filename: "torchtext-0.17.0+cpu-cp39-cp39-win_amd64.whl",
-                    hashes: Hashes {
-                        md5: None,
-                        sha256: None,
-                        sha384: None,
-                        sha512: None,
-                    },
-                    requires_python: None,
-                    size: None,
-                    upload_time: None,
-                    url: "cpu/torchtext-0.17.0%2Bcpu-cp39-cp39-win_amd64.whl",
-                    yanked: None,
-                },
-            ],
-        }
-        "###);
-    }
-
-    #[test]
-    fn parse_missing_hash() {
-        let text = r#"
-<!DOCTYPE html>
-<html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
-</html>
-<!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
-            base: BaseUrl(
-                Url {
-                    scheme: "https",
-                    cannot_be_a_base: false,
-                    username: "",
-                    password: None,
-                    host: Some(
-                        Domain(
-                            "download.pytorch.org",
-                        ),
-                    ),
-                    port: None,
-                    path: "/whl/jinja2/",
-                    query: None,
-                    fragment: None,
-                },
-            ),
-            files: [
-                File {
-                    core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
-                    filename: "Jinja2-3.1.2-py3-none-any.whl",
-                    hashes: Hashes {
-                        md5: None,
-                        sha256: None,
-                        sha384: None,
-                        sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -671,7 +484,231 @@ mod tests {
                 },
             ],
         }
-        "###);
+        "#);
+    }
+
+    #[test]
+    fn parse_escaped_fragment() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2&#43;233fca715f49-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2+233fca715f49-py3-none-any.whl</a><br/>
+</body>
+</html>
+<!--TIMESTAMP 1703347410-->
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
+            base: BaseUrl(
+                DisplaySafeUrl {
+                    scheme: "https",
+                    cannot_be_a_base: false,
+                    username: "",
+                    password: None,
+                    host: Some(
+                        Domain(
+                            "download.pytorch.org",
+                        ),
+                    ),
+                    port: None,
+                    path: "/whl/jinja2/",
+                    query: None,
+                    fragment: None,
+                },
+            ),
+            files: [
+                PypiFile {
+                    core_metadata: None,
+                    filename: "Jinja2-3.1.2+233fca715f49-py3-none-any.whl",
+                    hashes: Hashes {
+                        md5: None,
+                        sha256: Some(
+                            "6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61",
+                        ),
+                        sha384: None,
+                        sha512: None,
+                        blake2b: None,
+                    },
+                    requires_python: None,
+                    size: None,
+                    upload_time: None,
+                    url: "/whl/Jinja2-3.1.2+233fca715f49-py3-none-any.whl",
+                    yanked: None,
+                },
+            ],
+        }
+        "#);
+    }
+
+    #[test]
+    fn parse_encoded_fragment() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256%3D4095ada29e51070f7d199a0a5bdf5c8d8e238e03f0bf4dcc02571e78c9ae800d">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
+</html>
+<!--TIMESTAMP 1703347410-->
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
+            base: BaseUrl(
+                DisplaySafeUrl {
+                    scheme: "https",
+                    cannot_be_a_base: false,
+                    username: "",
+                    password: None,
+                    host: Some(
+                        Domain(
+                            "download.pytorch.org",
+                        ),
+                    ),
+                    port: None,
+                    path: "/whl/jinja2/",
+                    query: None,
+                    fragment: None,
+                },
+            ),
+            files: [
+                PypiFile {
+                    core_metadata: None,
+                    filename: "Jinja2-3.1.2-py3-none-any.whl",
+                    hashes: Hashes {
+                        md5: None,
+                        sha256: Some(
+                            "4095ada29e51070f7d199a0a5bdf5c8d8e238e03f0bf4dcc02571e78c9ae800d",
+                        ),
+                        sha384: None,
+                        sha512: None,
+                        blake2b: None,
+                    },
+                    requires_python: None,
+                    size: None,
+                    upload_time: None,
+                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
+                    yanked: None,
+                },
+            ],
+        }
+        "#);
+    }
+
+    #[test]
+    fn parse_quoted_filepath() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Links for jinja2</h1>
+<a href="cpu/torchtext-0.17.0%2Bcpu-cp39-cp39-win_amd64.whl">cpu/torchtext-0.17.0%2Bcpu-cp39-cp39-win_amd64.whl</a><br/>
+</body>
+</html>
+<!--TIMESTAMP 1703347410-->
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
+            base: BaseUrl(
+                DisplaySafeUrl {
+                    scheme: "https",
+                    cannot_be_a_base: false,
+                    username: "",
+                    password: None,
+                    host: Some(
+                        Domain(
+                            "download.pytorch.org",
+                        ),
+                    ),
+                    port: None,
+                    path: "/whl/jinja2/",
+                    query: None,
+                    fragment: None,
+                },
+            ),
+            files: [
+                PypiFile {
+                    core_metadata: None,
+                    filename: "torchtext-0.17.0+cpu-cp39-cp39-win_amd64.whl",
+                    hashes: Hashes {
+                        md5: None,
+                        sha256: None,
+                        sha384: None,
+                        sha512: None,
+                        blake2b: None,
+                    },
+                    requires_python: None,
+                    size: None,
+                    upload_time: None,
+                    url: "cpu/torchtext-0.17.0%2Bcpu-cp39-cp39-win_amd64.whl",
+                    yanked: None,
+                },
+            ],
+        }
+        "#);
+    }
+
+    #[test]
+    fn parse_missing_hash() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
+</html>
+<!--TIMESTAMP 1703347410-->
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
+            base: BaseUrl(
+                DisplaySafeUrl {
+                    scheme: "https",
+                    cannot_be_a_base: false,
+                    username: "",
+                    password: None,
+                    host: Some(
+                        Domain(
+                            "download.pytorch.org",
+                        ),
+                    ),
+                    port: None,
+                    path: "/whl/jinja2/",
+                    query: None,
+                    fragment: None,
+                },
+            ),
+            files: [
+                PypiFile {
+                    core_metadata: None,
+                    filename: "Jinja2-3.1.2-py3-none-any.whl",
+                    hashes: Hashes {
+                        md5: None,
+                        sha256: None,
+                        sha384: None,
+                        sha512: None,
+                        blake2b: None,
+                    },
+                    requires_python: None,
+                    size: None,
+                    upload_time: None,
+                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
+                    yanked: None,
+                },
+            ],
+        }
+        "#);
     }
 
     #[test]
@@ -679,16 +716,37 @@ mod tests {
         let text = r"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a>Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a>Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        ";
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap_err();
-        insta::assert_snapshot!(result, @"Missing href attribute on anchor link");
+    ";
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
+            base: BaseUrl(
+                DisplaySafeUrl {
+                    scheme: "https",
+                    cannot_be_a_base: false,
+                    username: "",
+                    password: None,
+                    host: Some(
+                        Domain(
+                            "download.pytorch.org",
+                        ),
+                    ),
+                    port: None,
+                    path: "/whl/jinja2/",
+                    query: None,
+                    fragment: None,
+                },
+            ),
+            files: [],
+        }
+        "#);
     }
 
     #[test]
@@ -696,16 +754,37 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap_err();
-        insta::assert_snapshot!(result, @"Missing href attribute on anchor link");
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
+            base: BaseUrl(
+                DisplaySafeUrl {
+                    scheme: "https",
+                    cannot_be_a_base: false,
+                    username: "",
+                    password: None,
+                    host: Some(
+                        Domain(
+                            "download.pytorch.org",
+                        ),
+                    ),
+                    port: None,
+                    path: "/whl/jinja2/",
+                    query: None,
+                    fragment: None,
+                },
+            ),
+            files: [],
+        }
+        "#);
     }
 
     #[test]
@@ -713,19 +792,19 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl#">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -742,26 +821,25 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.2-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
                     upload_time: None,
-                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl#",
+                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
                     yanked: None,
                 },
             ],
         }
-        "###);
+        "#);
     }
 
     #[test]
@@ -769,19 +847,19 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl?project=legacy">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl?project=legacy">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -798,16 +876,15 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.2-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -817,24 +894,121 @@ mod tests {
                 },
             ],
         }
-        "###);
+        "#);
     }
 
     #[test]
-    fn parse_missing_hash_value() {
+    fn parse_unknown_fragment() {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#main">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap_err();
-        insta::assert_snapshot!(result, @"Unexpected fragment (expected `#sha256=...` or similar) on URL: sha256");
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base);
+        insta::assert_debug_snapshot!(result, @r#"
+        Ok(
+            SimpleDetailHTML {
+                base: BaseUrl(
+                    DisplaySafeUrl {
+                        scheme: "https",
+                        cannot_be_a_base: false,
+                        username: "",
+                        password: None,
+                        host: Some(
+                            Domain(
+                                "download.pytorch.org",
+                            ),
+                        ),
+                        port: None,
+                        path: "/whl/jinja2/",
+                        query: None,
+                        fragment: None,
+                    },
+                ),
+                files: [
+                    PypiFile {
+                        core_metadata: None,
+                        filename: "Jinja2-3.1.2-py3-none-any.whl",
+                        hashes: Hashes {
+                            md5: None,
+                            sha256: None,
+                            sha384: None,
+                            sha512: None,
+                            blake2b: None,
+                        },
+                        requires_python: None,
+                        size: None,
+                        upload_time: None,
+                        url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
+                        yanked: None,
+                    },
+                ],
+            },
+        )
+        "#);
+    }
+
+    #[test]
+    fn parse_egg_fragment() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#main">Jinja2-3.1.2-py3-none-any.whl#egg=public-hello-0.1</a><br/>
+</body>
+</html>
+<!--TIMESTAMP 1703347410-->
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base);
+        insta::assert_debug_snapshot!(result, @r#"
+        Ok(
+            SimpleDetailHTML {
+                base: BaseUrl(
+                    DisplaySafeUrl {
+                        scheme: "https",
+                        cannot_be_a_base: false,
+                        username: "",
+                        password: None,
+                        host: Some(
+                            Domain(
+                                "download.pytorch.org",
+                            ),
+                        ),
+                        port: None,
+                        path: "/whl/jinja2/",
+                        query: None,
+                        fragment: None,
+                    },
+                ),
+                files: [
+                    PypiFile {
+                        core_metadata: None,
+                        filename: "Jinja2-3.1.2-py3-none-any.whl",
+                        hashes: Hashes {
+                            md5: None,
+                            sha256: None,
+                            sha384: None,
+                            sha512: None,
+                            blake2b: None,
+                        },
+                        requires_python: None,
+                        size: None,
+                        upload_time: None,
+                        url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
+                        yanked: None,
+                    },
+                ],
+            },
+        )
+        "#);
     }
 
     #[test]
@@ -842,37 +1016,39 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl#blake2=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#blake2=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
 <!--TIMESTAMP 1703347410-->
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap_err();
-        insta::assert_snapshot!(result, @"Unsupported hash algorithm (expected `md5`, `sha256`, `sha384`, or `sha512`) on: blake2=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61");
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap_err();
+        insta::assert_snapshot!(result, @"Unsupported hash algorithm (expected one of: `md5`, `sha256`, `sha384`, `sha512`, or `blake2b`) on: `blake2=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61`");
     }
 
     #[test]
     fn parse_flat_index_html() {
         let text = r#"
-            <!DOCTYPE html>
-            <html>
-            <head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head>
-            <body>
-                <a href="https://storage.googleapis.com/jax-releases/cuda100/jaxlib-0.1.52+cuda100-cp36-none-manylinux2010_x86_64.whl">cuda100/jaxlib-0.1.52+cuda100-cp36-none-manylinux2010_x86_64.whl</a><br>
-                <a href="https://storage.googleapis.com/jax-releases/cuda100/jaxlib-0.1.52+cuda100-cp37-none-manylinux2010_x86_64.whl">cuda100/jaxlib-0.1.52+cuda100-cp37-none-manylinux2010_x86_64.whl</a><br>
-            </body>
-            </html>
-        "#;
-        let base = Url::parse("https://storage.googleapis.com/jax-releases/jax_cuda_releases.html")
-            .unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+        <!DOCTYPE html>
+        <html>
+        <head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head>
+        <body>
+            <a href="https://storage.googleapis.com/jax-releases/cuda100/jaxlib-0.1.52+cuda100-cp36-none-manylinux2010_x86_64.whl">cuda100/jaxlib-0.1.52+cuda100-cp36-none-manylinux2010_x86_64.whl</a><br>
+            <a href="https://storage.googleapis.com/jax-releases/cuda100/jaxlib-0.1.52+cuda100-cp37-none-manylinux2010_x86_64.whl">cuda100/jaxlib-0.1.52+cuda100-cp37-none-manylinux2010_x86_64.whl</a><br>
+        </body>
+        </html>
+    "#;
+        let base = DisplaySafeUrl::parse(
+            "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html",
+        )
+        .unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -889,16 +1065,15 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "jaxlib-0.1.52+cuda100-cp36-none-manylinux2010_x86_64.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -906,16 +1081,15 @@ mod tests {
                     url: "https://storage.googleapis.com/jax-releases/cuda100/jaxlib-0.1.52+cuda100-cp36-none-manylinux2010_x86_64.whl",
                     yanked: None,
                 },
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "jaxlib-0.1.52+cuda100-cp37-none-manylinux2010_x86_64.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -925,7 +1099,7 @@ mod tests {
                 },
             ],
         }
-        "###);
+        "#);
     }
 
     /// Test for AWS Code Artifact
@@ -934,29 +1108,29 @@ mod tests {
     #[test]
     fn parse_code_artifact_index_html() {
         let text = r#"
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Links for flask</title>
-            </head>
-            <body>
-                <h1>Links for flask</h1>
-                <a href="0.1/Flask-0.1.tar.gz#sha256=9da884457e910bf0847d396cb4b778ad9f3c3d17db1c5997cb861937bd284237" data-gpg-sig="false" >Flask-0.1.tar.gz</a>
-                <br/>
-                <a href="0.10.1/Flask-0.10.1.tar.gz#sha256=4c83829ff83d408b5e1d4995472265411d2c414112298f2eb4b359d9e4563373" data-gpg-sig="false" >Flask-0.10.1.tar.gz</a>
-                <br/>
-                <a href="3.0.1/flask-3.0.1.tar.gz#sha256=6489f51bb3666def6f314e15f19d50a1869a19ae0e8c9a3641ffe66c77d42403" data-requires-python="&gt;=3.8" data-gpg-sig="false" >flask-3.0.1.tar.gz</a>
-                <br/>
-            </body>
-            </html>
-        "#;
-        let base = Url::parse("https://account.d.codeartifact.us-west-2.amazonaws.com/pypi/shared-packages-pypi/simple/flask/")
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Links for flask</title>
+        </head>
+        <body>
+            <h1>Links for flask</h1>
+            <a href="0.1/Flask-0.1.tar.gz#sha256=9da884457e910bf0847d396cb4b778ad9f3c3d17db1c5997cb861937bd284237" data-gpg-sig="false" >Flask-0.1.tar.gz</a>
+            <br/>
+            <a href="0.10.1/Flask-0.10.1.tar.gz#sha256=4c83829ff83d408b5e1d4995472265411d2c414112298f2eb4b359d9e4563373" data-gpg-sig="false" >Flask-0.10.1.tar.gz</a>
+            <br/>
+            <a href="3.0.1/flask-3.0.1.tar.gz#sha256=6489f51bb3666def6f314e15f19d50a1869a19ae0e8c9a3641ffe66c77d42403" data-requires-python="&gt;=3.8" data-gpg-sig="false" >flask-3.0.1.tar.gz</a>
+            <br/>
+        </body>
+        </html>
+    "#;
+        let base = DisplaySafeUrl::parse("https://account.d.codeartifact.us-west-2.amazonaws.com/pypi/shared-packages-pypi/simple/flask/")
             .unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -973,10 +1147,8 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Flask-0.1.tar.gz",
                     hashes: Hashes {
                         md5: None,
@@ -985,17 +1157,16 @@ mod tests {
                         ),
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
                     upload_time: None,
-                    url: "0.1/Flask-0.1.tar.gz#sha256=9da884457e910bf0847d396cb4b778ad9f3c3d17db1c5997cb861937bd284237",
+                    url: "0.1/Flask-0.1.tar.gz",
                     yanked: None,
                 },
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Flask-0.10.1.tar.gz",
                     hashes: Hashes {
                         md5: None,
@@ -1004,17 +1175,16 @@ mod tests {
                         ),
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
                     upload_time: None,
-                    url: "0.10.1/Flask-0.10.1.tar.gz#sha256=4c83829ff83d408b5e1d4995472265411d2c414112298f2eb4b359d9e4563373",
+                    url: "0.10.1/Flask-0.10.1.tar.gz",
                     yanked: None,
                 },
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "flask-3.0.1.tar.gz",
                     hashes: Hashes {
                         md5: None,
@@ -1023,6 +1193,7 @@ mod tests {
                         ),
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: Some(
                         Ok(
@@ -1038,12 +1209,12 @@ mod tests {
                     ),
                     size: None,
                     upload_time: None,
-                    url: "3.0.1/flask-3.0.1.tar.gz#sha256=6489f51bb3666def6f314e15f19d50a1869a19ae0e8c9a3641ffe66c77d42403",
+                    url: "3.0.1/flask-3.0.1.tar.gz",
                     yanked: None,
                 },
             ],
         }
-        "###);
+        "#);
     }
 
     #[test]
@@ -1051,18 +1222,18 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61" data-requires-python="&gt;=3.8,">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61" data-requires-python="&gt;=3.8,">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+</body>
 </html>
-        "#;
-        let base = Url::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+    "#;
+        let base = DisplaySafeUrl::parse("https://download.pytorch.org/whl/jinja2/").unwrap();
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -1079,10 +1250,8 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: None,
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.2-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
@@ -1091,6 +1260,7 @@ mod tests {
                         ),
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: Some(
                         Ok(
@@ -1106,12 +1276,12 @@ mod tests {
                     ),
                     size: None,
                     upload_time: None,
-                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl#sha256=6088930bfe239f0e6710546ab9c19c9ef35e29792895fed6e6e31a023a182a61",
+                    url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
                     yanked: None,
                 },
             ],
         }
-        "###);
+        "#);
     }
 
     /// Respect PEP 714 (see: <https://peps.python.org/pep-0714/>).
@@ -1120,23 +1290,23 @@ mod tests {
         let text = r#"
 <!DOCTYPE html>
 <html>
-  <body>
-    <h1>Links for jinja2</h1>
-    <a href="/whl/Jinja2-3.1.2-py3-none-any.whl" data-dist-info-metadata="true">Jinja2-3.1.2-py3-none-any.whl</a><br/>
-    <a href="/whl/Jinja2-3.1.3-py3-none-any.whl" data-core-metadata="true">Jinja2-3.1.3-py3-none-any.whl</a><br/>
-    <a href="/whl/Jinja2-3.1.4-py3-none-any.whl" data-dist-info-metadata="false">Jinja2-3.1.4-py3-none-any.whl</a><br/>
-    <a href="/whl/Jinja2-3.1.5-py3-none-any.whl" data-core-metadata="false">Jinja2-3.1.5-py3-none-any.whl</a><br/>
-    <a href="/whl/Jinja2-3.1.6-py3-none-any.whl" data-core-metadata="true" data-dist-info-metadata="false">Jinja2-3.1.6-py3-none-any.whl</a><br/>
-  </body>
+<body>
+<h1>Links for jinja2</h1>
+<a href="/whl/Jinja2-3.1.2-py3-none-any.whl" data-dist-info-metadata="true">Jinja2-3.1.2-py3-none-any.whl</a><br/>
+<a href="/whl/Jinja2-3.1.3-py3-none-any.whl" data-core-metadata="true">Jinja2-3.1.3-py3-none-any.whl</a><br/>
+<a href="/whl/Jinja2-3.1.4-py3-none-any.whl" data-dist-info-metadata="false">Jinja2-3.1.4-py3-none-any.whl</a><br/>
+<a href="/whl/Jinja2-3.1.5-py3-none-any.whl" data-core-metadata="false">Jinja2-3.1.5-py3-none-any.whl</a><br/>
+<a href="/whl/Jinja2-3.1.6-py3-none-any.whl" data-core-metadata="true" data-dist-info-metadata="false">Jinja2-3.1.6-py3-none-any.whl</a><br/>
+</body>
 </html>
-        "#;
-        let base = Url::parse("https://account.d.codeartifact.us-west-2.amazonaws.com/pypi/shared-packages-pypi/simple/flask/")
+    "#;
+        let base = DisplaySafeUrl::parse("https://account.d.codeartifact.us-west-2.amazonaws.com/pypi/shared-packages-pypi/simple/flask/")
             .unwrap();
-        let result = SimpleHtml::parse(text, &base).unwrap();
-        insta::assert_debug_snapshot!(result, @r###"
-        SimpleHtml {
+        let result = SimpleDetailHTML::parse(text, &base).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleDetailHTML {
             base: BaseUrl(
-                Url {
+                DisplaySafeUrl {
                     scheme: "https",
                     cannot_be_a_base: false,
                     username: "",
@@ -1153,20 +1323,19 @@ mod tests {
                 },
             ),
             files: [
-                File {
+                PypiFile {
                     core_metadata: Some(
                         Bool(
                             true,
                         ),
                     ),
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.2-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -1174,20 +1343,19 @@ mod tests {
                     url: "/whl/Jinja2-3.1.2-py3-none-any.whl",
                     yanked: None,
                 },
-                File {
+                PypiFile {
                     core_metadata: Some(
                         Bool(
                             true,
                         ),
                     ),
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.3-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -1195,20 +1363,19 @@ mod tests {
                     url: "/whl/Jinja2-3.1.3-py3-none-any.whl",
                     yanked: None,
                 },
-                File {
+                PypiFile {
                     core_metadata: Some(
                         Bool(
                             false,
                         ),
                     ),
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.4-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -1216,20 +1383,19 @@ mod tests {
                     url: "/whl/Jinja2-3.1.4-py3-none-any.whl",
                     yanked: None,
                 },
-                File {
+                PypiFile {
                     core_metadata: Some(
                         Bool(
                             false,
                         ),
                     ),
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.5-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -1237,20 +1403,19 @@ mod tests {
                     url: "/whl/Jinja2-3.1.5-py3-none-any.whl",
                     yanked: None,
                 },
-                File {
+                PypiFile {
                     core_metadata: Some(
                         Bool(
                             true,
                         ),
                     ),
-                    dist_info_metadata: None,
-                    data_dist_info_metadata: None,
                     filename: "Jinja2-3.1.6-py3-none-any.whl",
                     hashes: Hashes {
                         md5: None,
                         sha256: None,
                         sha384: None,
                         sha512: None,
+                        blake2b: None,
                     },
                     requires_python: None,
                     size: None,
@@ -1260,6 +1425,182 @@ mod tests {
                 },
             ],
         }
-        "###);
+        "#);
+    }
+
+    /// Test parsing Simple API index (root) HTML.
+    #[test]
+    fn parse_simple_index() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Simple Index</title>
+</head>
+<body>
+    <h1>Simple Index</h1>
+    <a href="/simple/flask/">flask</a><br/>
+    <a href="/simple/jinja2/">jinja2</a><br/>
+    <a href="/simple/requests/">requests</a><br/>
+</body>
+</html>
+    "#;
+        let result = SimpleIndexHtml::parse(text).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleIndexHtml {
+            projects: [
+                PackageName(
+                    "flask",
+                ),
+                PackageName(
+                    "jinja2",
+                ),
+                PackageName(
+                    "requests",
+                ),
+            ],
+        }
+        "#);
+    }
+
+    /// Test that project names are sorted.
+    #[test]
+    fn parse_simple_index_sorted() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+    <a href="/simple/zebra/">zebra</a><br/>
+    <a href="/simple/apple/">apple</a><br/>
+    <a href="/simple/monkey/">monkey</a><br/>
+</body>
+</html>
+    "#;
+        let result = SimpleIndexHtml::parse(text).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleIndexHtml {
+            projects: [
+                PackageName(
+                    "apple",
+                ),
+                PackageName(
+                    "monkey",
+                ),
+                PackageName(
+                    "zebra",
+                ),
+            ],
+        }
+        "#);
+    }
+
+    /// Test that links without `href` attributes are ignored.
+    #[test]
+    fn parse_simple_index_missing_href() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+    <h1>Simple Index</h1>
+    <a href="/simple/flask/">flask</a><br/>
+    <a>no-href-project</a><br/>
+    <a href="/simple/requests/">requests</a><br/>
+</body>
+</html>
+    "#;
+        let result = SimpleIndexHtml::parse(text).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleIndexHtml {
+            projects: [
+                PackageName(
+                    "flask",
+                ),
+                PackageName(
+                    "requests",
+                ),
+            ],
+        }
+        "#);
+    }
+
+    /// Test that links with empty `href` attributes are ignored.
+    #[test]
+    fn parse_simple_index_empty_href() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+    <a href="">empty-href</a><br/>
+    <a href="/simple/flask/">flask</a><br/>
+</body>
+</html>
+    "#;
+        let result = SimpleIndexHtml::parse(text).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleIndexHtml {
+            projects: [
+                PackageName(
+                    "flask",
+                ),
+            ],
+        }
+        "#);
+    }
+
+    /// Test that links with empty text content are ignored.
+    #[test]
+    fn parse_simple_index_empty_text() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+    <a href="/simple/empty/"></a><br/>
+    <a href="/simple/flask/">flask</a><br/>
+    <a href="/simple/whitespace/">   </a><br/>
+</body>
+</html>
+    "#;
+        let result = SimpleIndexHtml::parse(text).unwrap();
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleIndexHtml {
+            projects: [
+                PackageName(
+                    "flask",
+                ),
+            ],
+        }
+        "#);
+    }
+
+    /// Test parsing with case variations and normalization.
+    #[test]
+    fn parse_simple_index_case_variations() {
+        let text = r#"
+<!DOCTYPE html>
+<html>
+<body>
+    <a href="/simple/Flask/">Flask</a><br/>
+    <a href="/simple/django/">django</a><br/>
+    <a href="/simple/PyYAML/">PyYAML</a><br/>
+</body>
+</html>
+    "#;
+        let result = SimpleIndexHtml::parse(text).unwrap();
+        // Note: We preserve the case as returned by the server
+        insta::assert_debug_snapshot!(result, @r#"
+        SimpleIndexHtml {
+            projects: [
+                PackageName(
+                    "django",
+                ),
+                PackageName(
+                    "flask",
+                ),
+                PackageName(
+                    "pyyaml",
+                ),
+            ],
+        }
+        "#);
     }
 }

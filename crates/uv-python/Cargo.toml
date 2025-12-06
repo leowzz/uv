@@ -1,47 +1,63 @@
 [package]
 name = "uv-python"
-version = "0.0.1"
+version = "0.0.5"
+description = "This is an internal component crate of uv"
 edition = { workspace = true }
 rust-version = { workspace = true }
 homepage = { workspace = true }
-documentation = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
+
+[lib]
+doctest = false
 
 [lints]
 workspace = true
 
 [dependencies]
-cache-key = { workspace = true }
-install-wheel-rs = { workspace = true }
-pep440_rs = { workspace = true }
-pep508_rs = { workspace = true }
-platform-tags = { workspace = true }
-pypi-types = { workspace = true }
 uv-cache = { workspace = true }
-uv-configuration = { workspace = true }
+uv-cache-info = { workspace = true }
+uv-cache-key = { workspace = true }
 uv-client = { workspace = true }
+uv-dirs = { workspace = true }
+uv-distribution-filename = { workspace = true }
 uv-extract = { workspace = true }
 uv-fs = { workspace = true }
+uv-install-wheel = { workspace = true }
+uv-pep440 = { workspace = true }
+uv-pep508 = { workspace = true }
+uv-platform = { workspace = true }
+uv-platform-tags = { workspace = true }
+uv-preview = { workspace = true }
+uv-pypi-types = { workspace = true }
+uv-redacted = { workspace = true }
 uv-state = { workspace = true }
+uv-static = { workspace = true }
+uv-trampoline-builder = { workspace = true }
 uv-warnings = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true, optional = true }
 configparser = { workspace = true }
+dunce = { workspace = true }
 fs-err = { workspace = true, features = ["tokio"] }
 futures = { workspace = true }
+indexmap = { workspace = true }
 itertools = { workspace = true }
 owo-colors = { workspace = true }
+ref-cast = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
+reqwest-retry = { workspace = true }
 rmp-serde = { workspace = true }
+rustc-hash = { workspace = true }
 same-file = { workspace = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sys-info = { workspace = true }
 target-lexicon = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -51,18 +67,21 @@ tracing = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
 
-[target.'cfg(any(unix, target_os = "wasi", target_os = "redox"))'.dependencies]
-rustix = { workspace = true }
-
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true }
-winsafe = { workspace = true }
+windows-registry = { workspace = true }
+windows = { workspace = true }
 
 [dev-dependencies]
-anyhow = { version = "1.0.80" }
-assert_fs = { version = "1.1.1" }
-indoc = { version = "2.0.4" }
-itertools = { version = "0.13.0" }
-temp-env = { version = "0.3.6" }
-tempfile = { version = "3.9.0" }
-test-log = { version = "0.2.15", features = ["trace"], default-features = false }
+anyhow = { workspace = true }
+assert_fs = { workspace = true }
+indoc = { workspace = true }
+insta = { workspace = true }
+itertools = { workspace = true }
+temp-env = { workspace = true }
+tempfile = { workspace = true }
+test-log = { workspace = true }
+
+[build-dependencies]
+uv-static = { workspace = true }
+
+serde_json = { workspace = true }

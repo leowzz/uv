@@ -1,13 +1,17 @@
-pub use base_client::{BaseClient, BaseClientBuilder};
+pub use base_client::{
+    AuthIntegration, BaseClient, BaseClientBuilder, DEFAULT_RETRIES, ExtraMiddleware,
+    RedirectClientWithMiddleware, RequestBuilder, RetryParsingError, UvRetryableStrategy,
+    is_transient_network_error,
+};
 pub use cached_client::{CacheControl, CachedClient, CachedClientError, DataWithCachePolicy};
 pub use error::{Error, ErrorKind, WrappedReqwestError};
-pub use flat_index::{FlatIndexClient, FlatIndexEntries, FlatIndexError};
+pub use flat_index::{FlatIndexClient, FlatIndexEntries, FlatIndexEntry, FlatIndexError};
 pub use linehaul::LineHaul;
 pub use registry_client::{
-    Connectivity, RegistryClient, RegistryClientBuilder, SimpleMetadata, SimpleMetadatum,
-    VersionFiles,
+    Connectivity, MetadataFormat, RegistryClient, RegistryClientBuilder, SimpleDetailMetadata,
+    SimpleDetailMetadatum, SimpleIndexMetadata, VersionFiles,
 };
-pub use rkyvutil::OwnedArchive;
+pub use rkyvutil::{Deserializer, OwnedArchive, Serializer, Validator};
 
 mod base_client;
 mod cached_client;

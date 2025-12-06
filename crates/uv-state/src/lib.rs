@@ -4,13 +4,13 @@ use std::{
     sync::Arc,
 };
 
-use directories::ProjectDirs;
 use fs_err as fs;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 
 /// The main state storage abstraction.
 ///
-/// This is appropriate
+/// This is appropriate for storing persistent data that is not user-facing, such as managed Python
+/// installations or tool environments.
 #[derive(Debug, Clone)]
 pub struct StateStore {
     /// The state storage.
@@ -75,6 +75,7 @@ impl StateStore {
     }
 
     /// Prefer, in order:
+    ///
     /// 1. The specific state directory specified by the user.
     /// 2. The system-appropriate user-level data directory.
     /// 3. A `.uv` directory in the current working directory.
@@ -82,11 +83,16 @@ impl StateStore {
     /// Returns an absolute cache dir.
     pub fn from_settings(state_dir: Option<PathBuf>) -> Result<Self, io::Error> {
         if let Some(state_dir) = state_dir {
-            StateStore::from_path(state_dir)
-        } else if let Some(project_dirs) = ProjectDirs::from("", "", "uv") {
-            StateStore::from_path(project_dirs.data_dir())
+            Self::from_path(state_dir)
+        } else if let Some(data_dir) = uv_dirs::legacy_user_state_dir().filter(|dir| dir.exists()) {
+            // If the user has an existing directory at (e.g.) `/Users/user/Library/Application Support/uv`,
+            // respect it for backwards compatibility. Otherwise, prefer the XDG strategy, even on
+            // macOS.
+            Self::from_path(data_dir)
+        } else if let Some(data_dir) = uv_dirs::user_state_dir() {
+            Self::from_path(data_dir)
         } else {
-            StateStore::from_path(".uv")
+            Self::from_path(".uv")
         }
     }
 }
@@ -99,6 +105,8 @@ pub enum StateBucket {
     ManagedPython,
     /// Installed tools.
     Tools,
+    /// Credentials.
+    Credentials,
 }
 
 impl StateBucket {
@@ -106,6 +114,7 @@ impl StateBucket {
         match self {
             Self::ManagedPython => "python",
             Self::Tools => "tools",
+            Self::Credentials => "credentials",
         }
     }
 }

@@ -1,33 +1,34 @@
 use std::path::PathBuf;
 
+use owo_colors::OwoColorize;
 use tokio::task::JoinError;
-use url::Url;
 use zip::result::ZipError;
 
 use crate::metadata::MetadataError;
-use distribution_filename::WheelFilenameError;
-use pep440_rs::Version;
-use pypi_types::HashDigest;
 use uv_client::WrappedReqwestError;
-use uv_fs::Simplified;
+use uv_distribution_filename::{WheelFilename, WheelFilenameError};
+use uv_distribution_types::{InstalledDist, InstalledDistError, IsBuildBackendError};
+use uv_fs::{LockedFileError, Simplified};
+use uv_git::GitError;
 use uv_normalize::PackageName;
+use uv_pep440::{Version, VersionSpecifiers};
+use uv_platform_tags::Platform;
+use uv_pypi_types::{HashAlgorithm, HashDigest};
+use uv_redacted::DisplaySafeUrl;
+use uv_types::AnyErrorBuild;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Building source distributions is disabled")]
     NoBuild,
-    #[error("Using pre-built wheels is disabled")]
-    NoBinary,
 
     // Network error
-    #[error("Failed to parse URL: {0}")]
-    Url(String, #[source] url::ParseError),
     #[error("Expected an absolute path, but received: {}", _0.user_display())]
     RelativePath(PathBuf),
     #[error(transparent)]
-    JoinRelativeUrl(#[from] pypi_types::JoinRelativeError),
+    InvalidUrl(#[from] uv_distribution_types::ToUrlError),
     #[error("Expected a file URL, but received: {0}")]
-    NonFileUrl(Url),
+    NonFileUrl(DisplaySafeUrl),
     #[error(transparent)]
     Git(#[from] uv_git::GitResolverError),
     #[error(transparent)]
@@ -40,49 +41,108 @@ pub enum Error {
     CacheRead(#[source] std::io::Error),
     #[error("Failed to write to the distribution cache")]
     CacheWrite(#[source] std::io::Error),
+    #[error("Failed to acquire lock on the distribution cache")]
+    CacheLock(#[source] LockedFileError),
     #[error("Failed to deserialize cache entry")]
     CacheDecode(#[from] rmp_serde::decode::Error),
     #[error("Failed to serialize cache entry")]
     CacheEncode(#[from] rmp_serde::encode::Error),
+    #[error("Failed to walk the distribution cache")]
+    CacheWalk(#[source] walkdir::Error),
+    #[error(transparent)]
+    CacheInfo(#[from] uv_cache_info::CacheInfoError),
 
     // Build error
-    #[error("Failed to build: `{0}`")]
-    Build(String, #[source] anyhow::Error),
-    #[error("Failed to build editable: `{0}`")]
-    BuildEditable(String, #[source] anyhow::Error),
+    #[error(transparent)]
+    Build(AnyErrorBuild),
     #[error("Built wheel has an invalid filename")]
     WheelFilename(#[from] WheelFilenameError),
     #[error("Package metadata name `{metadata}` does not match given name `{given}`")]
-    NameMismatch {
+    WheelMetadataNameMismatch {
         given: PackageName,
         metadata: PackageName,
     },
     #[error("Package metadata version `{metadata}` does not match given version `{given}`")]
-    VersionMismatch { given: Version, metadata: Version },
+    WheelMetadataVersionMismatch { given: Version, metadata: Version },
+    #[error(
+        "Package metadata name `{metadata}` does not match `{filename}` from the wheel filename"
+    )]
+    WheelFilenameNameMismatch {
+        filename: PackageName,
+        metadata: PackageName,
+    },
+    #[error(
+        "Package metadata version `{metadata}` does not match `{filename}` from the wheel filename"
+    )]
+    WheelFilenameVersionMismatch {
+        filename: Version,
+        metadata: Version,
+    },
+    /// This shouldn't happen, it's a bug in the build backend.
+    #[error(
+        "The built wheel `{}` is not compatible with the current Python {}.{} on {} {}",
+        filename,
+        python_version.0,
+        python_version.1,
+        python_platform.os(),
+        python_platform.arch(),
+    )]
+    BuiltWheelIncompatibleHostPlatform {
+        filename: WheelFilename,
+        python_platform: Platform,
+        python_version: (u8, u8),
+    },
+    /// This may happen when trying to cross-install native dependencies without their build backend
+    /// being aware that the target is a cross-install.
+    #[error(
+        "The built wheel `{}` is not compatible with the target Python {}.{} on {} {}. Consider using `--no-build` to disable building wheels.",
+        filename,
+        python_version.0,
+        python_version.1,
+        python_platform.os(),
+        python_platform.arch(),
+    )]
+    BuiltWheelIncompatibleTargetPlatform {
+        filename: WheelFilename,
+        python_platform: Platform,
+        python_version: (u8, u8),
+    },
     #[error("Failed to parse metadata from built wheel")]
-    Metadata(#[from] pypi_types::MetadataError),
-    #[error("Failed to read `dist-info` metadata from built wheel")]
-    DistInfo(#[from] install_wheel_rs::Error),
+    Metadata(#[from] uv_pypi_types::MetadataError),
+    #[error("Failed to read metadata: `{}`", _0.user_display())]
+    WheelMetadata(PathBuf, #[source] Box<uv_metadata::Error>),
+    #[error("Failed to read metadata from installed package `{0}`")]
+    ReadInstalled(Box<InstalledDist>, #[source] InstalledDistError),
     #[error("Failed to read zip archive from built wheel")]
     Zip(#[from] ZipError),
-    #[error("Source distribution directory contains neither readable `pyproject.toml` nor `setup.py`: `{}`", _0.user_display())]
-    DirWithoutEntrypoint(PathBuf),
-    #[error("Failed to extract archive")]
-    Extract(#[from] uv_extract::Error),
+    #[error("Failed to extract archive: {0}")]
+    Extract(String, #[source] uv_extract::Error),
     #[error("The source distribution is missing a `PKG-INFO` file")]
     MissingPkgInfo,
+    #[error("The source distribution `{}` has no subdirectory `{}`", _0, _1.display())]
+    MissingSubdirectory(DisplaySafeUrl, PathBuf),
+    #[error("The source distribution `{0}` is missing Git LFS artifacts.")]
+    MissingGitLfsArtifacts(DisplaySafeUrl, #[source] GitError),
     #[error("Failed to extract static metadata from `PKG-INFO`")]
-    PkgInfo(#[source] pypi_types::MetadataError),
+    PkgInfo(#[source] uv_pypi_types::MetadataError),
+    #[error("Failed to extract metadata from `requires.txt`")]
+    RequiresTxt(#[source] uv_pypi_types::MetadataError),
     #[error("The source distribution is missing a `pyproject.toml` file")]
     MissingPyprojectToml,
     #[error("Failed to extract static metadata from `pyproject.toml`")]
-    PyprojectToml(#[source] pypi_types::MetadataError),
+    PyprojectToml(#[source] uv_pypi_types::MetadataError),
     #[error("Unsupported scheme in URL: {0}")]
     UnsupportedScheme(String),
     #[error(transparent)]
     MetadataLowering(#[from] MetadataError),
     #[error("Distribution not found at: {0}")]
-    NotFound(Url),
+    NotFound(DisplaySafeUrl),
+    #[error("Attempted to re-extract the source distribution for `{}`, but the {} hash didn't match. Run `{}` to clear the cache.", _0, _1, "uv cache clean".green())]
+    CacheHeal(String, HashAlgorithm),
+    #[error("The source distribution requires Python {0}, but {1} is installed")]
+    RequiresPython(VersionSpecifiers, Version),
+    #[error("Failed to identify base Python interpreter")]
+    BaseInterpreter(#[source] std::io::Error),
 
     /// A generic request middleware error happened while making a request.
     /// Refer to the error message for more details.
@@ -109,13 +169,17 @@ pub enum Error {
     )]
     MissingHashes { distribution: String },
 
-    #[error("Hash-checking is enabled, but no hashes were computed for: `{distribution}`\n\nExpected:\n{expected}")]
+    #[error(
+        "Hash-checking is enabled, but no hashes were computed for: `{distribution}`\n\nExpected:\n{expected}"
+    )]
     MissingActualHashes {
         distribution: String,
         expected: String,
     },
 
-    #[error("Hash-checking is enabled, but no hashes were provided for: `{distribution}`\n\nComputed:\n{actual}")]
+    #[error(
+        "Hash-checking is enabled, but no hashes were provided for: `{distribution}`\n\nComputed:\n{actual}"
+    )]
     MissingExpectedHashes {
         distribution: String,
         actual: String,
@@ -145,13 +209,22 @@ impl From<reqwest_middleware::Error> for Error {
     }
 }
 
+impl IsBuildBackendError for Error {
+    fn is_build_backend_error(&self) -> bool {
+        match self {
+            Self::Build(err) => err.is_build_backend_error(),
+            _ => false,
+        }
+    }
+}
+
 impl Error {
     /// Construct a hash mismatch error.
     pub fn hash_mismatch(
         distribution: String,
         expected: &[HashDigest],
         actual: &[HashDigest],
-    ) -> Error {
+    ) -> Self {
         match (expected.is_empty(), actual.is_empty()) {
             (true, true) => Self::MissingHashes { distribution },
             (true, false) => {

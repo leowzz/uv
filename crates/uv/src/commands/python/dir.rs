@@ -1,22 +1,27 @@
-use anstream::println;
+use std::fmt::Write;
+
 use anyhow::Context;
 use owo_colors::OwoColorize;
 
-use uv_configuration::PreviewMode;
 use uv_fs::Simplified;
-use uv_python::managed::ManagedPythonInstallations;
-use uv_warnings::warn_user_once;
+use uv_python::managed::{ManagedPythonInstallations, python_executable_dir};
 
-/// Show the toolchain directory.
-pub(crate) fn dir(preview: PreviewMode) -> anyhow::Result<()> {
-    if preview.is_disabled() {
-        warn_user_once!("`uv python dir` is experimental and may change without warning");
+use crate::printer::Printer;
+
+/// Show the Python installation directory.
+pub(crate) fn dir(bin: bool, printer: Printer) -> anyhow::Result<()> {
+    if bin {
+        let bin = python_executable_dir()?;
+        writeln!(printer.stdout(), "{}", bin.simplified_display().cyan())?;
+    } else {
+        let installed_toolchains = ManagedPythonInstallations::from_settings(None)
+            .context("Failed to initialize toolchain settings")?;
+        writeln!(
+            printer.stdout(),
+            "{}",
+            installed_toolchains.root().simplified_display().cyan()
+        )?;
     }
-    let installed_toolchains = ManagedPythonInstallations::from_settings()
-        .context("Failed to initialize toolchain settings")?;
-    println!(
-        "{}",
-        installed_toolchains.root().simplified_display().cyan()
-    );
+
     Ok(())
 }

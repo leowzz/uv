@@ -1,14 +1,15 @@
-use either::Either;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
-use pep508_rs::MarkerEnvironment;
-use pypi_types::Requirement;
-use uv_configuration::{Constraints, Overrides};
-use uv_normalize::{GroupName, PackageName};
+use either::Either;
+
+use uv_configuration::{Constraints, Excludes, Overrides};
+use uv_distribution_types::Requirement;
+use uv_normalize::PackageName;
 use uv_types::RequestedRequirements;
 
 use crate::preferences::Preferences;
-use crate::{DependencyMode, Exclusions};
+use crate::{DependencyMode, Exclusions, ResolverEnvironment};
 
 /// A manifest of requirements, constraints, and preferences.
 #[derive(Clone, Debug)]
@@ -22,9 +23,8 @@ pub struct Manifest {
     /// The overrides for the project.
     pub(crate) overrides: Overrides,
 
-    /// The enabled development dependency groups for the project. Dependency groups are global,
-    /// such that any provided groups will be enabled for all requirements.
-    pub(crate) dev: Vec<GroupName>,
+    /// The dependency excludes for the project.
+    pub(crate) excludes: Excludes,
 
     /// The preferences for the project.
     ///
@@ -35,6 +35,9 @@ pub struct Manifest {
 
     /// The name of the project.
     pub(crate) project: Option<PackageName>,
+
+    /// Members of the project's workspace.
+    pub(crate) workspace_members: BTreeSet<PackageName>,
 
     /// The installed packages to exclude from consideration during resolution.
     ///
@@ -55,9 +58,10 @@ impl Manifest {
         requirements: Vec<Requirement>,
         constraints: Constraints,
         overrides: Overrides,
-        dev: Vec<GroupName>,
+        excludes: Excludes,
         preferences: Preferences,
         project: Option<PackageName>,
+        workspace_members: BTreeSet<PackageName>,
         exclusions: Exclusions,
         lookaheads: Vec<RequestedRequirements>,
     ) -> Self {
@@ -65,9 +69,10 @@ impl Manifest {
             requirements,
             constraints,
             overrides,
-            dev,
+            excludes,
             preferences,
             project,
+            workspace_members,
             exclusions,
             lookaheads,
         }
@@ -78,10 +83,11 @@ impl Manifest {
             requirements,
             constraints: Constraints::default(),
             overrides: Overrides::default(),
-            dev: Vec::new(),
+            excludes: Excludes::default(),
             preferences: Preferences::default(),
             project: None,
             exclusions: Exclusions::default(),
+            workspace_members: BTreeSet::new(),
             lookaheads: Vec::new(),
         }
     }
@@ -99,20 +105,19 @@ impl Manifest {
     /// - Determining which requirements should allow yanked versions.
     /// - Determining which requirements should allow pre-release versions (e.g., `torch>=2.2.0a1`).
     /// - Determining which requirements should allow direct URLs (e.g., `torch @ https://...`).
-    /// - Determining which requirements should allow local version specifiers (e.g., `torch==2.2.0+cpu`).
     pub fn requirements<'a>(
         &'a self,
-        markers: Option<&'a MarkerEnvironment>,
+        env: &'a ResolverEnvironment,
         mode: DependencyMode,
     ) -> impl Iterator<Item = Cow<'a, Requirement>> + 'a {
-        self.requirements_no_overrides(markers, mode)
-            .chain(self.overrides(markers, mode))
+        self.requirements_no_overrides(env, mode)
+            .chain(self.overrides(env, mode))
     }
 
     /// Like [`Self::requirements`], but without the overrides.
     pub fn requirements_no_overrides<'a>(
         &'a self,
-        markers: Option<&'a MarkerEnvironment>,
+        env: &'a ResolverEnvironment,
         mode: DependencyMode,
     ) -> impl Iterator<Item = Cow<'a, Requirement>> + 'a {
         match mode {
@@ -123,19 +128,27 @@ impl Manifest {
                     .flat_map(move |lookahead| {
                         self.overrides
                             .apply(lookahead.requirements())
+                            .filter(|requirement| !self.excludes.contains(&requirement.name))
                             .filter(move |requirement| {
-                                requirement.evaluate_markers(markers, lookahead.extras())
+                                requirement
+                                    .evaluate_markers(env.marker_environment(), lookahead.extras())
                             })
                     })
                     .chain(
                         self.overrides
                             .apply(&self.requirements)
-                            .filter(move |requirement| requirement.evaluate_markers(markers, &[])),
+                            .filter(|requirement| !self.excludes.contains(&requirement.name))
+                            .filter(move |requirement| {
+                                requirement.evaluate_markers(env.marker_environment(), &[])
+                            }),
                     )
                     .chain(
                         self.constraints
                             .requirements()
-                            .filter(move |requirement| requirement.evaluate_markers(markers, &[]))
+                            .filter(|requirement| !self.excludes.contains(&requirement.name))
+                            .filter(move |requirement| {
+                                requirement.evaluate_markers(env.marker_environment(), &[])
+                            })
                             .map(Cow::Borrowed),
                     ),
             ),
@@ -144,7 +157,10 @@ impl Manifest {
                 self.overrides
                     .apply(&self.requirements)
                     .chain(self.constraints.requirements().map(Cow::Borrowed))
-                    .filter(move |requirement| requirement.evaluate_markers(markers, &[])),
+                    .filter(|requirement| !self.excludes.contains(&requirement.name))
+                    .filter(move |requirement| {
+                        requirement.evaluate_markers(env.marker_environment(), &[])
+                    }),
             ),
         }
     }
@@ -152,7 +168,7 @@ impl Manifest {
     /// Only the overrides from [`Self::requirements`].
     pub fn overrides<'a>(
         &'a self,
-        markers: Option<&'a MarkerEnvironment>,
+        env: &'a ResolverEnvironment,
         mode: DependencyMode,
     ) -> impl Iterator<Item = Cow<'a, Requirement>> + 'a {
         match mode {
@@ -160,14 +176,20 @@ impl Manifest {
             DependencyMode::Transitive => Either::Left(
                 self.overrides
                     .requirements()
-                    .filter(move |requirement| requirement.evaluate_markers(markers, &[]))
+                    .filter(|requirement| !self.excludes.contains(&requirement.name))
+                    .filter(move |requirement| {
+                        requirement.evaluate_markers(env.marker_environment(), &[])
+                    })
                     .map(Cow::Borrowed),
             ),
             // Include direct requirements, with constraints and overrides applied.
             DependencyMode::Direct => Either::Right(
                 self.overrides
                     .requirements()
-                    .filter(move |requirement| requirement.evaluate_markers(markers, &[]))
+                    .filter(|requirement| !self.excludes.contains(&requirement.name))
+                    .filter(move |requirement| {
+                        requirement.evaluate_markers(env.marker_environment(), &[])
+                    })
                     .map(Cow::Borrowed),
             ),
         }
@@ -185,7 +207,7 @@ impl Manifest {
     ///   the `lowest-direct` strategy is in use.
     pub fn user_requirements<'a>(
         &'a self,
-        markers: Option<&'a MarkerEnvironment>,
+        env: &'a ResolverEnvironment,
         mode: DependencyMode,
     ) -> impl Iterator<Item = Cow<'a, Requirement>> + 'a {
         match mode {
@@ -199,22 +221,25 @@ impl Manifest {
                         self.overrides
                             .apply(lookahead.requirements())
                             .filter(move |requirement| {
-                                requirement.evaluate_markers(markers, lookahead.extras())
+                                requirement
+                                    .evaluate_markers(env.marker_environment(), lookahead.extras())
                             })
                     })
                     .chain(
                         self.overrides
                             .apply(&self.requirements)
-                            .filter(move |requirement| requirement.evaluate_markers(markers, &[])),
+                            .filter(move |requirement| {
+                                requirement.evaluate_markers(env.marker_environment(), &[])
+                            }),
                     ),
             ),
 
             // Restrict to the direct requirements.
-            DependencyMode::Direct => Either::Right(
-                self.overrides
-                    .apply(self.requirements.iter())
-                    .filter(move |requirement| requirement.evaluate_markers(markers, &[])),
-            ),
+            DependencyMode::Direct => {
+                Either::Right(self.overrides.apply(self.requirements.iter()).filter(
+                    move |requirement| requirement.evaluate_markers(env.marker_environment(), &[]),
+                ))
+            }
         }
     }
 
@@ -225,11 +250,11 @@ impl Manifest {
     ///   resolution (assuming the user enabled development dependencies).
     pub fn direct_requirements<'a>(
         &'a self,
-        markers: Option<&'a MarkerEnvironment>,
+        env: &'a ResolverEnvironment,
     ) -> impl Iterator<Item = Cow<'a, Requirement>> + 'a {
         self.overrides
             .apply(self.requirements.iter())
-            .filter(move |requirement| requirement.evaluate_markers(markers, &[]))
+            .filter(move |requirement| requirement.evaluate_markers(env.marker_environment(), &[]))
     }
 
     /// Apply the overrides and constraints to a set of requirements.

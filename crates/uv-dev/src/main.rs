@@ -4,104 +4,22 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::Instant;
 
-use anstream::{eprintln, println};
-use anyhow::Result;
-use clap::Parser;
+use anstream::eprintln;
 use owo_colors::OwoColorize;
-use tracing::{debug, instrument};
-use tracing_durations_export::plot::PlotConfig;
+use tracing::{debug, trace};
 use tracing_durations_export::DurationsLayerBuilder;
+use tracing_durations_export::plot::PlotConfig;
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-use crate::build::{build, BuildArgs};
-use crate::clear_compile::ClearCompileArgs;
-use crate::compile::CompileArgs;
-use crate::generate_all::Args as GenerateAllArgs;
-use crate::generate_cli_reference::Args as GenerateCliReferenceArgs;
-use crate::generate_json_schema::Args as GenerateJsonSchemaArgs;
-use crate::generate_options_reference::Args as GenerateOptionsReferenceArgs;
-#[cfg(feature = "render")]
-use crate::render_benchmarks::RenderBenchmarksArgs;
-use crate::wheel_metadata::WheelMetadataArgs;
-
-#[cfg(target_os = "windows")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(all(
-    not(target_os = "windows"),
-    not(target_os = "openbsd"),
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64"
-    )
-))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-mod build;
-mod clear_compile;
-mod compile;
-mod generate_all;
-mod generate_cli_reference;
-mod generate_json_schema;
-mod generate_options_reference;
-mod render_benchmarks;
-mod wheel_metadata;
-
-const ROOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
-
-#[derive(Parser)]
-enum Cli {
-    /// Build a source distribution into a wheel.
-    Build(BuildArgs),
-    /// Display the metadata for a `.whl` at a given URL.
-    WheelMetadata(WheelMetadataArgs),
-    /// Compile all `.py` to `.pyc` files in the tree.
-    Compile(CompileArgs),
-    /// Remove all `.pyc` in the tree.
-    ClearCompile(ClearCompileArgs),
-    /// Run all code and documentation generation steps.
-    GenerateAll(GenerateAllArgs),
-    /// Generate JSON schema for the TOML configuration file.
-    GenerateJSONSchema(GenerateJsonSchemaArgs),
-    /// Generate the options reference for the documentation.
-    GenerateOptionsReference(GenerateOptionsReferenceArgs),
-    /// Generate the CLI reference for the documentation.
-    GenerateCliReference(GenerateCliReferenceArgs),
-    #[cfg(feature = "render")]
-    /// Render the benchmarks.
-    RenderBenchmarks(RenderBenchmarksArgs),
-}
-
-#[instrument] // Anchor span to check for overhead
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    match cli {
-        Cli::Build(args) => {
-            let target = build(args).await?;
-            println!("Wheel built to {}", target.display());
-        }
-        Cli::WheelMetadata(args) => wheel_metadata::wheel_metadata(args).await?,
-        Cli::Compile(args) => compile::compile(args).await?,
-        Cli::ClearCompile(args) => clear_compile::clear_compile(&args)?,
-        Cli::GenerateAll(args) => generate_all::main(&args)?,
-        Cli::GenerateJSONSchema(args) => generate_json_schema::main(&args)?,
-        Cli::GenerateOptionsReference(args) => generate_options_reference::main(&args)?,
-        Cli::GenerateCliReference(args) => generate_cli_reference::main(&args)?,
-        #[cfg(feature = "render")]
-        Cli::RenderBenchmarks(args) => render_benchmarks::render_benchmarks(&args)?,
-    }
-    Ok(())
-}
+use uv_dev::run;
+use uv_static::EnvVars;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let (duration_layer, _guard) = if let Ok(location) = env::var("TRACING_DURATIONS_FILE") {
+    let (duration_layer, _guard) = if let Ok(location) = env::var(EnvVars::TRACING_DURATIONS_FILE) {
         let location = PathBuf::from(location);
         if let Some(parent) = location.parent() {
             fs_err::tokio::create_dir_all(&parent)
@@ -150,9 +68,10 @@ async fn main() -> ExitCode {
     let result = run().await;
     debug!("Took {}ms", start.elapsed().as_millis());
     if let Err(err) = result {
+        trace!("Error trace: {err:?}");
         eprintln!("{}", "uv-dev failed".red().bold());
         for err in err.chain() {
-            eprintln!("  {}: {}", "Caused by".red().bold(), err);
+            eprintln!("  {}: {}", "Caused by".red().bold(), err.to_string().trim());
         }
         ExitCode::FAILURE
     } else {

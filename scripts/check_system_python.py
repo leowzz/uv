@@ -24,7 +24,7 @@ def install_package(*, uv: str, package: str):
         check=True,
     )
 
-    logging.info(f"Checking that `{package}` can be imported.")
+    logging.info(f"Checking that `{package}` can be imported with `{sys.executable}`.")
     code = subprocess.run(
         [sys.executable, "-c", f"import {package}"],
         cwd=temp_dir,
@@ -47,12 +47,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Set if the Python installation has an EXTERNALLY-MANAGED marker.",
     )
+    parser.add_argument(
+        "--python",
+        required=False,
+        help="Set if the system Python version must be explicitly specified, e.g., for prereleases.",
+    )
     args = parser.parse_args()
 
     uv: str = os.path.abspath(args.uv) if args.uv else "uv"
     allow_externally_managed = (
         ["--break-system-packages"] if args.externally_managed else []
     )
+    python = ["--python", args.python] if args.python else []
 
     # Create a temporary directory.
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -68,13 +74,17 @@ if __name__ == "__main__":
         # Install the package (`pylint`).
         logging.info("Installing the package `pylint`.")
         subprocess.run(
-            [uv, "pip", "install", "pylint", "--system"] + allow_externally_managed,
+            [uv, "pip", "install", "pylint", "--system", "--verbose"]
+            + allow_externally_managed
+            + python,
             cwd=temp_dir,
             check=True,
         )
 
         # Ensure that the package (`pylint`) is installed.
-        logging.info("Checking that `pylint` is installed.")
+        logging.info(
+            f"Checking that `pylint` is installed with `{sys.executable} -m pip`."
+        )
         code = subprocess.run(
             [sys.executable, "-m", "pip", "show", "pylint"],
             cwd=temp_dir,
@@ -93,7 +103,9 @@ if __name__ == "__main__":
         # Uninstall the package (`pylint`).
         logging.info("Uninstalling the package `pylint`.")
         subprocess.run(
-            [uv, "pip", "uninstall", "pylint", "--system"] + allow_externally_managed,
+            [uv, "pip", "uninstall", "pylint", "--system"]
+            + allow_externally_managed
+            + python,
             cwd=temp_dir,
             check=True,
         )
@@ -187,8 +199,8 @@ if __name__ == "__main__":
         # Attempt to install NumPy.
         # This ensures that we can successfully install a package with native libraries.
         #
-        # NumPy doesn't distribute wheels for Python 3.13 (at time of writing).
-        if sys.version_info < (3, 13):
+        # NumPy doesn't distribute wheels for Python 3.13 or GraalPy (at time of writing).
+        if sys.version_info < (3, 13) and sys.implementation.name != "graalpy":
             install_package(uv=uv, package="numpy")
 
         # Attempt to install `pydantic_core`.

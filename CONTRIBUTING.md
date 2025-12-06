@@ -1,37 +1,50 @@
 # Contributing
 
-We have issues labeled as
-[Good First Issue](https://github.com/astral-sh/uv/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)
-and
-[Help Wanted](https://github.com/astral-sh/uv/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22)
-which are good opportunities for new contributors.
+## Finding ways to help
+
+We label issues that would be good for a first time contributor as
+[`good first issue`](https://github.com/astral-sh/uv/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22).
+These usually do not require significant experience with Rust or the uv code base.
+
+We label issues that we think are a good opportunity for subsequent contributions as
+[`help wanted`](https://github.com/astral-sh/uv/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22).
+These require varying levels of experience with Rust and uv. Often, we want to accomplish these
+tasks but do not have the resources to do so ourselves.
+
+You don't need our permission to start on an issue we have labeled as appropriate for community
+contribution as described above. However, it's a good idea to indicate that you are going to work on
+an issue to avoid concurrent attempts to solve the same problem.
+
+Please check in with us before starting work on an issue that has not been labeled as appropriate
+for community contribution. We're happy to receive contributions for other issues, but it's
+important to make sure we have consensus on the solution to the problem first.
+
+Outside of issues with the labels above, issues labeled as
+[`bug`](https://github.com/astral-sh/uv/issues?q=is%3Aopen+is%3Aissue+label%3A%22bug%22) are the
+best candidates for contribution. In contrast, issues labeled with `needs-decision` or
+`needs-design` are _not_ good candidates for contribution. Please do not open pull requests for
+issues with these labels.
+
+Please do not open pull requests for new features without prior discussion. While we appreciate
+exploration of new features, we will almost always close these pull requests immediately. Adding a
+new feature to uv creates a long-term maintenance burden and requires strong consensus from the uv
+team before it is appropriate to begin work on an implementation.
 
 ## Setup
 
-[Rust](https://rustup.rs/), a C compiler, and CMake are required to build uv.
+[Rust](https://rustup.rs/) (and a C compiler) are required to build uv.
 
-### Linux
-
-On Ubuntu and other Debian-based distributions, you can install the C compiler and CMake with:
+On Ubuntu and other Debian-based distributions, you can install a C compiler with:
 
 ```shell
-sudo apt install build-essential cmake
+sudo apt install build-essential
 ```
 
-### macOS
-
-You can install CMake with Homebrew:
+On Fedora-based distributions, you can install a C compiler with:
 
 ```shell
-brew install cmake
+sudo dnf install gcc
 ```
-
-See the [Python](#python) section for instructions on installing the Python versions.
-
-### Windows
-
-You can install CMake from the [installers](https://cmake.org/download/) or with
-`pipx install cmake`.
 
 ## Testing
 
@@ -47,7 +60,38 @@ Testing uv requires multiple specific Python versions; they can be installed wit
 cargo run python install
 ```
 
-The storage directory can be configured with `UV_PYTHON_INSTALL_DIR`.
+The storage directory can be configured with `UV_PYTHON_INSTALL_DIR`. (It must be an absolute path.)
+
+### Snapshot testing
+
+uv uses [insta](https://insta.rs/) for snapshot testing. It's recommended (but not necessary) to use
+`cargo-insta` for a better snapshot review experience. See the
+[installation guide](https://insta.rs/docs/cli/) for more information.
+
+In tests, you can use `uv_snapshot!` macro to simplify creating snapshots for uv commands. For
+example:
+
+```rust
+#[test]
+fn test_add() {
+    let context = TestContext::new("3.12");
+    uv_snapshot!(context.filters(), context.add().arg("requests"), @"");
+}
+```
+
+To run and review a specific snapshot test:
+
+```shell
+cargo test --package <package> --test <test> -- <test_name> -- --exact
+cargo insta review
+```
+
+### Git and Git LFS
+
+A subset of uv tests require both [Git](https://git-scm.com) and [Git LFS](https://git-lfs.com/) to
+execute properly.
+
+These tests can be disabled by turning off either `git` or `git-lfs` uv features.
 
 ### Local testing
 
@@ -58,18 +102,6 @@ cargo run -- venv
 cargo run -- pip install requests
 ```
 
-### Testing on Windows
-
-When testing debug builds on Windows, the stack can overflow resulting in a `STATUS_STACK_OVERFLOW`
-error code. This is due to a small stack size limit on Windows that we encounter when running
-unoptimized builds — the release builds do not have this problem. We
-[added a `UV_STACK_SIZE` variable](https://github.com/astral-sh/uv/pull/941) to bypass this problem
-during testing. We recommend bumping the stack size from the default of 1MB to 2MB, for example:
-
-```powershell
-$Env:UV_STACK_SIZE = '2000000'
-```
-
 ## Running inside a Docker container
 
 Source distributions can run arbitrary code on build and can make unwanted modifications to your
@@ -78,8 +110,8 @@ system
 ["nvidia-pyindex" on PyPI](https://pypi.org/project/nvidia-pyindex/)), which can even occur when
 just resolving requirements. To prevent this, there's a Docker container you can run commands in:
 
-```bash
-docker buildx build -t uv-builder -f builder.dockerfile --load .
+```console
+$ docker build -t uv-builder -f crates/uv-dev/builder.dockerfile --load .
 # Build for musl to avoid glibc errors, might not be required with your OS version
 cargo build --target x86_64-unknown-linux-musl --profile profiling
 docker run --rm -it -v $(pwd):/app uv-builder /app/target/x86_64-unknown-linux-musl/profiling/uv-dev resolve-many --cache-dir /app/cache-docker /app/scripts/popular_packages/pypi_10k_most_dependents.txt
@@ -137,38 +169,16 @@ To preview any changes to the documentation locally:
 
 1. Install the [Rust toolchain](https://www.rust-lang.org/tools/install).
 
-1. Run `cargo dev generate-all`, to update any auto-generated documentation.
+2. Run `cargo dev generate-all`, to update any auto-generated documentation.
 
-1. Install MkDocs and Material for MkDocs with:
-
-   ```shell
-   uv venv
-
-   # For contributors.
-   uv pip install -r docs/requirements.txt
-
-   # Or, for members of the Astral org, which has access to MkDocs Insiders via sponsorship.
-   uv pip install -r docs/requirements-insiders.txt
-   ```
-
-1. Activate the virtual environment with:
-
-   ```shell
-   # On macOS and Linux.
-   source .venv/bin/activate
-
-   # On Windows.
-   .venv\Scripts\activate
-   ```
-
-1. Run the development server with:
+3. Run the development server with:
 
    ```shell
    # For contributors.
-   mkdocs serve -f mkdocs.public.yml
+   uvx --with-requirements docs/requirements.txt -- mkdocs serve -f mkdocs.public.yml
 
    # For members of the Astral org, which has access to MkDocs Insiders via sponsorship.
-   mkdocs serve -f mkdocs.insiders.yml
+   uvx --with-requirements docs/requirements-insiders.txt -- mkdocs serve -f mkdocs.insiders.yml
    ```
 
 The documentation should then be available locally at
@@ -192,19 +202,26 @@ After making changes to the documentation, format the markdown files with:
 npx prettier --prose-wrap always --write "**/*.md"
 ```
 
+Note that the command above requires Node.js and npm to be installed on your system. As an
+alternative, you can run this command using Docker:
+
+```console
+$ docker run --rm -v .:/src/ -w /src/ node:alpine npx prettier --prose-wrap always --write "**/*.md"
+```
+
 ## Releases
 
 Releases can only be performed by Astral team members.
 
 Changelog entries and version bumps are automated. First, run:
 
-```
+```shell
 ./scripts/release.sh
 ```
 
 Then, editorialize the `CHANGELOG.md` file to ensure entries are consistently styled.
 
-Then, open a pull request e.g. `Bump version to ...`.
+Then, open a pull request, e.g., `Bump version to ...`.
 
 Binary builds will automatically be tested for the release.
 

@@ -1,11 +1,10 @@
+use crate::{Error, ErrorKind};
 use async_http_range_reader::AsyncHttpRangeReader;
 use futures::io::BufReader;
 use tokio_util::compat::TokioAsyncReadCompatExt;
-
-use distribution_filename::WheelFilename;
-use install_wheel_rs::metadata::find_archive_dist_info;
-
-use crate::{Error, ErrorKind};
+use url::Url;
+use uv_distribution_filename::WheelFilename;
+use uv_metadata::find_archive_dist_info;
 
 /// Read the `.dist-info/METADATA` file from a async remote zip reader, so we avoid downloading the
 /// entire wheel just for the one file.
@@ -50,6 +49,7 @@ use crate::{Error, ErrorKind};
 /// rest of the crate.
 pub(crate) async fn wheel_metadata_from_remote_zip(
     filename: &WheelFilename,
+    debug_name: &Url,
     reader: &mut AsyncHttpRangeReader,
 ) -> Result<String, Error> {
     // Make sure we have the back part of the stream.
@@ -75,7 +75,7 @@ pub(crate) async fn wheel_metadata_from_remote_zip(
             .enumerate()
             .filter_map(|(idx, e)| Some(((idx, e), e.filename().as_str().ok()?))),
     )
-    .map_err(ErrorKind::DistInfo)?;
+    .map_err(|err| ErrorKind::Metadata(debug_name.to_string(), err))?;
 
     let offset = metadata_entry.header_offset();
     let size = metadata_entry.compressed_size()
@@ -85,7 +85,7 @@ pub(crate) async fn wheel_metadata_from_remote_zip(
     // The zip archive uses as BufReader which reads in chunks of 8192. To ensure we prefetch
     // enough data we round the size up to the nearest multiple of the buffer size.
     let buffer_size = 8192;
-    let size = ((size + buffer_size - 1) / buffer_size) * buffer_size;
+    let size = size.div_ceil(buffer_size) * buffer_size;
 
     // Fetch the bytes from the zip archive that contain the requested file.
     reader

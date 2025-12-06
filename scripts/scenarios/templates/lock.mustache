@@ -5,21 +5,21 @@
 //!
 #![cfg(all(feature = "python", feature = "pypi"))]
 #![allow(clippy::needless_raw_string_hashes)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::doc_lazy_continuation)]
 
 use anyhow::Result;
 use assert_cmd::assert::OutputAssertExt;
 use assert_fs::prelude::*;
 use insta::assert_snapshot;
 
-use common::{packse_index_url, TestContext, uv_snapshot};
+use uv_static::EnvVars;
 
-mod common;
+use crate::common::{TestContext, packse_index_url, uv_snapshot};
 
 {{#scenarios}}
 
-{{#description_lines}}
-/// {{.}}
-{{/description_lines}}
+/// {{description}}
 ///
 /// ```text
 /// {{name}}
@@ -49,21 +49,29 @@ fn {{module_name}}() -> Result<()> {
         {{#root.requires_python}}
         requires-python = "{{.}}"
         {{/root.requires_python}}
+        {{#resolver_options.has_required_environments}}
+        [tool.uv]
+        required-environments = [
+          {{#resolver_options.required_environments}}
+          '''{{.}}''',
+          {{/resolver_options.required_environments}}
+        ]
+        {{/resolver_options.has_required_environments}}
         "###
     )?;
 
     let mut cmd = context.lock();
-    cmd.env_remove("UV_EXCLUDE_NEWER");
+    cmd.env_remove(EnvVars::UV_EXCLUDE_NEWER);
     cmd.arg("--index-url").arg(packse_index_url());
-    {{#expected.explanation_lines}}
-    // {{.}}
-    {{/expected.explanation_lines}}
+    {{#expected.explanation}}
+    // {{expected.explanation}}
+    {{/expected.explanation}}
     uv_snapshot!(filters, cmd, @r###"<snapshot>
     "###
     );
 
     {{#expected.satisfiable}}
-    let lock = fs_err::read_to_string(context.temp_dir.join("uv.lock"))?;
+    let lock = context.read("uv.lock");
     insta::with_settings!({
         filters => filters,
     }, {
@@ -73,16 +81,15 @@ fn {{module_name}}() -> Result<()> {
         );
     });
 
-    // Assert the idempotence of `uv lock`
+    // Assert the idempotence of `uv lock` when resolving from the lockfile (`--locked`).
     context
         .lock()
-        .env_remove("UV_EXCLUDE_NEWER")
+        .arg("--locked")
+        .env_remove(EnvVars::UV_EXCLUDE_NEWER)
         .arg("--index-url")
-        .arg("https://astral-sh.github.io/packse/0.3.31/simple-html/")
+        .arg(packse_index_url())
         .assert()
         .success();
-    let lock2 = fs_err::read_to_string(context.temp_dir.join("uv.lock"))?;
-    assert_eq!(lock2, lock);
     {{/expected.satisfiable}}
 
     Ok(())

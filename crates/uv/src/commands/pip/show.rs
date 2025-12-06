@@ -1,20 +1,25 @@
 use std::fmt::Write;
 
 use anyhow::Result;
+use fs_err::File;
 use itertools::{Either, Itertools};
 use owo_colors::OwoColorize;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 
-use distribution_types::{Diagnostic, Name};
 use uv_cache::Cache;
-use uv_configuration::PreviewMode;
+use uv_distribution_types::{Diagnostic, Name};
 use uv_fs::Simplified;
+use uv_install_wheel::read_record_file;
 use uv_installer::SitePackages;
 use uv_normalize::PackageName;
-use uv_python::{EnvironmentPreference, PythonEnvironment, PythonRequest};
+use uv_preview::Preview;
+use uv_python::{
+    EnvironmentPreference, Prefix, PythonEnvironment, PythonPreference, PythonRequest, Target,
+};
 
 use crate::commands::ExitStatus;
+use crate::commands::pip::operations::report_target_environment;
 use crate::printer::Printer;
 
 /// Show information about one or more installed packages.
@@ -23,9 +28,12 @@ pub(crate) fn pip_show(
     strict: bool,
     python: Option<&str>,
     system: bool,
-    _preview: PreviewMode,
+    target: Option<Target>,
+    prefix: Option<Prefix>,
+    files: bool,
     cache: &Cache,
     printer: Printer,
+    preview: Preview,
 ) -> Result<ExitStatus> {
     if packages.is_empty() {
         #[allow(clippy::print_stderr)]
@@ -44,20 +52,36 @@ pub(crate) fn pip_show(
     let environment = PythonEnvironment::find(
         &python.map(PythonRequest::parse).unwrap_or_default(),
         EnvironmentPreference::from_system_flag(system, false),
+        PythonPreference::default().with_system_flag(system),
         cache,
+        preview,
     )?;
 
-    debug!(
-        "Using Python {} environment at {}",
-        environment.interpreter().python_version(),
-        environment.python_executable().user_display().cyan()
-    );
+    // Apply any `--target` or `--prefix` directories.
+    let environment = if let Some(target) = target {
+        debug!(
+            "Using `--target` directory at {}",
+            target.root().user_display()
+        );
+        environment.with_target(target)?
+    } else if let Some(prefix) = prefix {
+        debug!(
+            "Using `--prefix` directory at {}",
+            prefix.root().user_display()
+        );
+        environment.with_prefix(prefix)?
+    } else {
+        environment
+    };
+
+    report_target_environment(&environment, cache, printer)?;
 
     // Build the installed index.
     let site_packages = SitePackages::from_environment(&environment)?;
 
-    // Determine the markers to use for resolution.
-    let markers = environment.interpreter().markers();
+    // Determine the markers and tags to use for resolution.
+    let markers = environment.interpreter().resolver_marker_environment();
+    let tags = environment.interpreter().tags()?;
 
     // Sort and deduplicate the packages, which are keyed by name.
     packages.sort_unstable();
@@ -97,14 +121,14 @@ pub(crate) fn pip_show(
     let mut requires_map = FxHashMap::default();
     // For Requires field
     for dist in &distributions {
-        if let Ok(metadata) = dist.metadata() {
+        if let Ok(metadata) = dist.read_metadata() {
             requires_map.insert(
                 dist.name(),
                 metadata
                     .requires_dist
-                    .into_iter()
-                    .filter(|req| req.evaluate_markers(markers, &[]))
-                    .map(|req| req.name)
+                    .iter()
+                    .filter(|req| req.evaluate_markers(&markers, &[]))
+                    .map(|req| &req.name)
                     .sorted_unstable()
                     .dedup()
                     .collect_vec(),
@@ -117,12 +141,12 @@ pub(crate) fn pip_show(
             if requires_map.contains_key(installed.name()) {
                 continue;
             }
-            if let Ok(metadata) = installed.metadata() {
+            if let Ok(metadata) = installed.read_metadata() {
                 let requires = metadata
                     .requires_dist
-                    .into_iter()
-                    .filter(|req| req.evaluate_markers(markers, &[]))
-                    .map(|req| req.name)
+                    .iter()
+                    .filter(|req| req.evaluate_markers(&markers, &[]))
+                    .map(|req| &req.name)
                     .collect_vec();
                 if !requires.is_empty() {
                     requires_map.insert(installed.name(), requires);
@@ -145,7 +169,7 @@ pub(crate) fn pip_show(
             printer.stdout(),
             "Location: {}",
             distribution
-                .path()
+                .install_path()
                 .parent()
                 .expect("package path is not root")
                 .simplified_display()
@@ -174,7 +198,7 @@ pub(crate) fn pip_show(
                 .iter()
                 .filter(|(name, pkgs)| {
                     **name != distribution.name()
-                        && pkgs.iter().any(|pkg| pkg == distribution.name())
+                        && pkgs.iter().any(|pkg| *pkg == distribution.name())
                 })
                 .map(|(name, _)| name)
                 .sorted_unstable()
@@ -190,11 +214,21 @@ pub(crate) fn pip_show(
                 )?;
             }
         }
+
+        // If requests, show the list of installed files.
+        if files {
+            let path = distribution.install_path().join("RECORD");
+            let record = read_record_file(&mut File::open(path)?)?;
+            writeln!(printer.stdout(), "Files:")?;
+            for entry in record {
+                writeln!(printer.stdout(), "  {}", entry.path)?;
+            }
+        }
     }
 
     // Validate that the environment is consistent.
     if strict {
-        for diagnostic in site_packages.diagnostics()? {
+        for diagnostic in site_packages.diagnostics(&markers, tags)? {
             writeln!(
                 printer.stderr(),
                 "{}{} {}",

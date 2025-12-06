@@ -1,232 +1,211 @@
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::vec;
 
-use anstream::eprint;
 use anyhow::Result;
-use miette::{Diagnostic, IntoDiagnostic};
 use owo_colors::OwoColorize;
 use thiserror::Error;
 
-use distribution_types::IndexLocations;
-use install_wheel_rs::linker::LinkMode;
-use pypi_types::Requirement;
-use uv_auth::store_credentials_from_url;
 use uv_cache::Cache;
-use uv_client::{BaseClientBuilder, Connectivity, FlatIndexClient, RegistryClientBuilder};
+use uv_client::{BaseClientBuilder, FlatIndexClient, RegistryClientBuilder};
 use uv_configuration::{
-    BuildOptions, Concurrency, ConfigSettings, IndexStrategy, KeyringProviderType, NoBinary,
-    NoBuild, PreviewMode, SetupPyStrategy,
+    BuildOptions, Concurrency, Constraints, DependencyGroups, IndexStrategy, KeyringProviderType,
+    NoBinary, NoBuild, SourceStrategy,
 };
-use uv_dispatch::BuildDispatch;
-use uv_fs::{Simplified, CWD};
+use uv_dispatch::{BuildDispatch, SharedState};
+use uv_distribution_types::{
+    ConfigSettings, DependencyMetadata, ExtraBuildRequires, Index, IndexLocations,
+    PackageConfigSettings, Requirement,
+};
+use uv_fs::Simplified;
+use uv_install_wheel::LinkMode;
+use uv_normalize::DefaultGroups;
+use uv_preview::{Preview, PreviewFeatures};
 use uv_python::{
-    request_from_version_file, EnvironmentPreference, PythonFetch, PythonInstallation,
-    PythonPreference, PythonRequest, VersionRequest,
+    EnvironmentPreference, PythonDownloads, PythonInstallation, PythonPreference, PythonRequest,
 };
-use uv_resolver::{ExcludeNewer, FlatIndex, RequiresPython};
-use uv_shell::Shell;
-use uv_types::{BuildContext, BuildIsolation, HashStrategy};
-use uv_warnings::warn_user_once;
-use uv_workspace::{DiscoveryOptions, VirtualProject, WorkspaceError};
+use uv_resolver::{ExcludeNewer, FlatIndex};
+use uv_settings::PythonInstallMirrors;
+use uv_shell::{Shell, shlex_posix, shlex_windows};
+use uv_types::{AnyErrorBuild, BuildContext, BuildIsolation, BuildStack, HashStrategy};
+use uv_virtualenv::OnExisting;
+use uv_warnings::warn_user;
+use uv_workspace::{DiscoveryOptions, VirtualProject, WorkspaceCache, WorkspaceError};
 
-use crate::commands::project::find_requires_python;
+use crate::commands::ExitStatus;
+use crate::commands::pip::loggers::{DefaultInstallLogger, InstallLogger};
+use crate::commands::pip::operations::{Changelog, report_interpreter};
+use crate::commands::project::{WorkspacePython, validate_project_requires_python};
 use crate::commands::reporters::PythonDownloadReporter;
-use crate::commands::{pip, ExitStatus, SharedState};
 use crate::printer::Printer;
 
-/// Create a virtual environment.
-#[allow(clippy::unnecessary_wraps, clippy::fn_params_excessive_bools)]
-pub(crate) async fn venv(
-    path: &Path,
-    python_request: Option<&str>,
-    python_preference: PythonPreference,
-    python_fetch: PythonFetch,
-    link_mode: LinkMode,
-    index_locations: &IndexLocations,
-    index_strategy: IndexStrategy,
-    keyring_provider: KeyringProviderType,
-    prompt: uv_virtualenv::Prompt,
-    system_site_packages: bool,
-    connectivity: Connectivity,
-    seed: bool,
-    allow_existing: bool,
-    exclude_newer: Option<ExcludeNewer>,
-    native_tls: bool,
-    preview: PreviewMode,
-    cache: &Cache,
-    printer: Printer,
-    relocatable: bool,
-) -> Result<ExitStatus> {
-    match venv_impl(
-        path,
-        python_request,
-        link_mode,
-        index_locations,
-        index_strategy,
-        keyring_provider,
-        prompt,
-        system_site_packages,
-        connectivity,
-        seed,
-        preview,
-        python_preference,
-        python_fetch,
-        allow_existing,
-        exclude_newer,
-        native_tls,
-        cache,
-        printer,
-        relocatable,
-    )
-    .await
-    {
-        Ok(status) => Ok(status),
-        Err(err) => {
-            eprint!("{err:?}");
-            Ok(ExitStatus::Failure)
-        }
-    }
-}
+use super::project::default_dependency_groups;
 
-#[derive(Error, Debug, Diagnostic)]
+#[derive(Error, Debug)]
 enum VenvError {
-    #[error("Failed to create virtualenv")]
-    #[diagnostic(code(uv::venv::creation))]
+    #[error("Failed to create virtual environment")]
     Creation(#[source] uv_virtualenv::Error),
 
-    #[error("Failed to install seed packages")]
-    #[diagnostic(code(uv::venv::seed))]
-    Seed(#[source] anyhow::Error),
+    #[error("Failed to install seed packages into virtual environment")]
+    Seed(#[source] AnyErrorBuild),
 
-    #[error("Failed to extract interpreter tags")]
-    #[diagnostic(code(uv::venv::tags))]
-    Tags(#[source] platform_tags::TagsError),
+    #[error("Failed to extract interpreter tags for installing seed packages")]
+    Tags(#[source] uv_platform_tags::TagsError),
 
     #[error("Failed to resolve `--find-links` entry")]
-    #[diagnostic(code(uv::venv::flat_index))]
     FlatIndex(#[source] uv_client::FlatIndexError),
 }
 
 /// Create a virtual environment.
-#[allow(clippy::fn_params_excessive_bools)]
-async fn venv_impl(
-    path: &Path,
-    python_request: Option<&str>,
+#[allow(clippy::unnecessary_wraps, clippy::fn_params_excessive_bools)]
+pub(crate) async fn venv(
+    project_dir: &Path,
+    path: Option<PathBuf>,
+    python_request: Option<PythonRequest>,
+    install_mirrors: PythonInstallMirrors,
+    python_preference: PythonPreference,
+    python_downloads: PythonDownloads,
     link_mode: LinkMode,
     index_locations: &IndexLocations,
     index_strategy: IndexStrategy,
+    dependency_metadata: DependencyMetadata,
     keyring_provider: KeyringProviderType,
+    client_builder: &BaseClientBuilder<'_>,
     prompt: uv_virtualenv::Prompt,
     system_site_packages: bool,
-    connectivity: Connectivity,
     seed: bool,
-    preview: PreviewMode,
-    python_preference: PythonPreference,
-    python_fetch: PythonFetch,
-    allow_existing: bool,
-    exclude_newer: Option<ExcludeNewer>,
-    native_tls: bool,
+    on_existing: OnExisting,
+    exclude_newer: ExcludeNewer,
+    concurrency: Concurrency,
+    no_config: bool,
+    no_project: bool,
     cache: &Cache,
     printer: Printer,
     relocatable: bool,
-) -> miette::Result<ExitStatus> {
-    if preview.is_disabled() && relocatable {
-        warn_user_once!("`--relocatable` is experimental and may change without warning");
-    }
+    preview: Preview,
+) -> Result<ExitStatus> {
+    let workspace_cache = WorkspaceCache::default();
+    let project = if no_project {
+        None
+    } else {
+        match VirtualProject::discover(project_dir, &DiscoveryOptions::default(), &workspace_cache)
+            .await
+        {
+            Ok(project) => Some(project),
+            Err(WorkspaceError::MissingProject(_)) => None,
+            Err(WorkspaceError::MissingPyprojectToml) => None,
+            Err(WorkspaceError::NonWorkspace(_)) => None,
+            Err(WorkspaceError::Toml(path, err)) => {
+                warn_user!(
+                    "Failed to parse `{}` during environment creation:\n{}",
+                    path.user_display().cyan(),
+                    textwrap::indent(&err.to_string(), "  ")
+                );
+                None
+            }
+            Err(err) => {
+                warn_user!("{err}");
+                None
+            }
+        }
+    };
 
-    let client_builder = BaseClientBuilder::default()
-        .connectivity(connectivity)
-        .native_tls(native_tls);
+    // Determine the default path; either the virtual environment for the project or `.venv`
+    let path = path.unwrap_or(
+        project
+            .as_ref()
+            .and_then(|project| {
+                // Only use the project environment path if we're invoked from the root
+                // This isn't strictly necessary and we may want to change it later, but this
+                // avoids a breaking change when adding project environment support to `uv venv`.
+                (project.workspace().install_path() == project_dir)
+                    .then(|| project.workspace().venv(Some(false)))
+            })
+            .unwrap_or(PathBuf::from(".venv")),
+    );
 
     let reporter = PythonDownloadReporter::single(printer);
 
-    // (1) Explicit request from user
-    let mut interpreter_request = python_request.map(PythonRequest::parse);
-
-    // (2) Request from `.python-version`
-    if preview.is_enabled() && interpreter_request.is_none() {
-        interpreter_request =
-            request_from_version_file(&std::env::current_dir().into_diagnostic()?)
-                .await
-                .into_diagnostic()?;
-    }
-
-    // (3) `Requires-Python` in `pyproject.toml`
-    if preview.is_enabled() && interpreter_request.is_none() {
-        let project = match VirtualProject::discover(&CWD, &DiscoveryOptions::default()).await {
-            Ok(project) => Some(project),
-            Err(WorkspaceError::MissingPyprojectToml) => None,
-            Err(WorkspaceError::NonWorkspace(_)) => None,
-            Err(err) => return Err(err).into_diagnostic(),
-        };
-
-        if let Some(project) = project {
-            interpreter_request = find_requires_python(project.workspace())
-                .into_diagnostic()?
-                .as_ref()
-                .map(RequiresPython::specifiers)
-                .map(|specifiers| {
-                    PythonRequest::Version(VersionRequest::Range(specifiers.clone()))
-                });
-        }
-    }
+    // If the default dependency-groups demand a higher requires-python
+    // we should bias an empty venv to that to avoid churn.
+    let default_groups = match &project {
+        Some(project) => default_dependency_groups(project.pyproject_toml())?,
+        None => DefaultGroups::default(),
+    };
+    let groups = DependencyGroups::default().with_defaults(default_groups);
+    let WorkspacePython {
+        source,
+        python_request,
+        requires_python,
+    } = WorkspacePython::from_request(
+        python_request,
+        project.as_ref().map(VirtualProject::workspace),
+        &groups,
+        project_dir,
+        no_config,
+    )
+    .await?;
 
     // Locate the Python interpreter to use in the environment
-    let python = PythonInstallation::find_or_fetch(
-        interpreter_request,
-        EnvironmentPreference::OnlySystem,
-        python_preference,
-        python_fetch,
-        &client_builder,
-        cache,
-        Some(&reporter),
-    )
-    .await
-    .into_diagnostic()?;
-
-    let managed = python.source().is_managed();
-    let interpreter = python.into_interpreter();
-
-    // Add all authenticated sources to the cache.
-    for url in index_locations.urls() {
-        store_credentials_from_url(url);
-    }
-
-    if managed {
-        writeln!(
-            printer.stderr(),
-            "Using Python {}",
-            interpreter.python_version().cyan()
+    let interpreter = {
+        let python = PythonInstallation::find_or_download(
+            python_request.as_ref(),
+            EnvironmentPreference::OnlySystem,
+            python_preference,
+            python_downloads,
+            client_builder,
+            cache,
+            Some(&reporter),
+            install_mirrors.python_install_mirror.as_deref(),
+            install_mirrors.pypy_install_mirror.as_deref(),
+            install_mirrors.python_downloads_json_url.as_deref(),
+            preview,
         )
-        .into_diagnostic()?;
-    } else {
-        writeln!(
-            printer.stderr(),
-            "Using Python {} interpreter at: {}",
-            interpreter.python_version(),
-            interpreter.sys_executable().user_display().cyan()
-        )
-        .into_diagnostic()?;
+        .await?;
+        report_interpreter(&python, false, printer)?;
+        python.into_interpreter()
+    };
+
+    // Check if the discovered Python version is incompatible with the current workspace
+    if let Some(requires_python) = requires_python {
+        match validate_project_requires_python(
+            &interpreter,
+            project.as_ref().map(VirtualProject::workspace),
+            &groups,
+            &requires_python,
+            &source,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                warn_user!("{err}");
+            }
+        }
     }
 
     writeln!(
         printer.stderr(),
-        "Creating virtualenv {}at: {}",
+        "Creating virtual environment {}at: {}",
         if seed { "with seed packages " } else { "" },
         path.user_display().cyan()
-    )
-    .into_diagnostic()?;
+    )?;
+
+    let upgradeable = preview.is_enabled(PreviewFeatures::PYTHON_UPGRADE)
+        && python_request
+            .as_ref()
+            .is_none_or(|request| !request.includes_patch());
 
     // Create the virtual environment.
     let venv = uv_virtualenv::create_venv(
-        path,
+        &path,
         interpreter,
         prompt,
         system_site_packages,
-        allow_existing,
+        on_existing,
         relocatable,
+        seed,
+        upgradeable,
+        preview,
     )
     .map_err(VenvError::Creation)?;
 
@@ -235,15 +214,9 @@ async fn venv_impl(
         // Extract the interpreter.
         let interpreter = venv.interpreter();
 
-        // Add all authenticated sources to the cache.
-        for url in index_locations.urls() {
-            store_credentials_from_url(url);
-        }
-
         // Instantiate a client.
-        let client = RegistryClientBuilder::from(client_builder)
-            .cache(cache.clone())
-            .index_urls(index_locations.index_urls())
+        let client = RegistryClientBuilder::new(client_builder.clone(), cache.clone())
+            .index_locations(index_locations.clone())
             .index_strategy(index_strategy)
             .keyring(keyring_provider)
             .markers(interpreter.markers())
@@ -253,9 +226,9 @@ async fn venv_impl(
         // Resolve the flat indexes from `--find-links`.
         let flat_index = {
             let tags = interpreter.tags().map_err(VenvError::Tags)?;
-            let client = FlatIndexClient::new(&client, cache);
+            let client = FlatIndexClient::new(client.cached_client(), client.connectivity(), cache);
             let entries = client
-                .fetch(index_locations.flat_index())
+                .fetch_all(index_locations.flat_indexes().map(Index::url))
                 .await
                 .map_err(VenvError::FlatIndex)?;
             FlatIndex::from_entries(
@@ -268,16 +241,19 @@ async fn venv_impl(
 
         // Initialize any shared state.
         let state = SharedState::default();
+        let workspace_cache = WorkspaceCache::default();
 
-        // For seed packages, assume the default settings and concurrency is sufficient.
+        // For seed packages, assume a bunch of default settings are sufficient.
+        let build_constraints = Constraints::default();
+        let build_hasher = HashStrategy::default();
         let config_settings = ConfigSettings::default();
-        let concurrency = Concurrency::default();
+        let config_settings_package = PackageConfigSettings::default();
+        let sources = SourceStrategy::Disabled;
 
         // Do not allow builds
         let build_options = BuildOptions::new(NoBinary::None, NoBuild::All);
-
-        let build_constraints = [];
-
+        let extra_build_requires = ExtraBuildRequires::default();
+        let extra_build_variables = uv_distribution_types::ExtraBuildVariables::default();
         // Prep the build context.
         let build_dispatch = BuildDispatch::new(
             &client,
@@ -286,49 +262,55 @@ async fn venv_impl(
             interpreter,
             index_locations,
             &flat_index,
-            &state.index,
-            &state.git,
-            &state.in_flight,
+            &dependency_metadata,
+            state.clone(),
             index_strategy,
-            SetupPyStrategy::default(),
             &config_settings,
+            &config_settings_package,
             BuildIsolation::Isolated,
+            &extra_build_requires,
+            &extra_build_variables,
             link_mode,
             &build_options,
+            &build_hasher,
             exclude_newer,
+            sources,
+            workspace_cache,
             concurrency,
             preview,
         );
 
         // Resolve the seed packages.
-        let requirements = if interpreter.python_tuple() < (3, 12) {
-            // Only include `setuptools` and `wheel` on Python <3.12
-            vec![
-                Requirement::from(pep508_rs::Requirement::from_str("pip").unwrap()),
-                Requirement::from(pep508_rs::Requirement::from_str("setuptools").unwrap()),
-                Requirement::from(pep508_rs::Requirement::from_str("wheel").unwrap()),
-            ]
-        } else {
+        let requirements = if interpreter.python_tuple() >= (3, 12) {
             vec![Requirement::from(
-                pep508_rs::Requirement::from_str("pip").unwrap(),
+                uv_pep508::Requirement::from_str("pip").unwrap(),
             )]
+        } else {
+            // Include `setuptools` and `wheel` on Python <3.12.
+            vec![
+                Requirement::from(uv_pep508::Requirement::from_str("pip").unwrap()),
+                Requirement::from(uv_pep508::Requirement::from_str("setuptools").unwrap()),
+                Requirement::from(uv_pep508::Requirement::from_str("wheel").unwrap()),
+            ]
         };
+
+        let build_stack = BuildStack::default();
 
         // Resolve and install the requirements.
         //
         // Since the virtual environment is empty, and the set of requirements is trivial (no
         // constraints, no editables, etc.), we can use the build dispatch APIs directly.
         let resolution = build_dispatch
-            .resolve(&requirements)
+            .resolve(&requirements, &build_stack)
             .await
-            .map_err(VenvError::Seed)?;
+            .map_err(|err| VenvError::Seed(err.into()))?;
         let installed = build_dispatch
-            .install(&resolution, &venv)
+            .install(&resolution, &venv, &build_stack)
             .await
-            .map_err(VenvError::Seed)?;
+            .map_err(|err| VenvError::Seed(err.into()))?;
 
-        pip::operations::report_modifications(installed, Vec::new(), Vec::new(), printer)
-            .into_diagnostic()?;
+        let changelog = Changelog::from_installed(installed);
+        DefaultInstallLogger.on_complete(&changelog, printer)?;
     }
 
     // Determine the appropriate activation command.
@@ -357,42 +339,8 @@ async fn venv_impl(
         Some(Shell::Cmd) => Some(shlex_windows(venv.scripts().join("activate"), Shell::Cmd)),
     };
     if let Some(act) = activation {
-        writeln!(printer.stderr(), "Activate with: {}", act.green()).into_diagnostic()?;
+        writeln!(printer.stderr(), "Activate with: {}", act.green())?;
     }
 
     Ok(ExitStatus::Success)
-}
-
-/// Quote a path, if necessary, for safe use in a POSIX-compatible shell command.
-fn shlex_posix(executable: impl AsRef<Path>) -> String {
-    // Convert to a display path.
-    let executable = executable.as_ref().user_display().to_string();
-
-    // Like Python's `shlex.quote`:
-    // > Use single quotes, and put single quotes into double quotes
-    // > The string $'b is then quoted as '$'"'"'b'
-    if executable.contains(' ') {
-        format!("'{}'", executable.replace('\'', r#"'"'"'"#))
-    } else {
-        executable
-    }
-}
-
-/// Quote a path, if necessary, for safe use in `PowerShell` and `cmd`.
-fn shlex_windows(executable: impl AsRef<Path>, shell: Shell) -> String {
-    // Convert to a display path.
-    let executable = executable.as_ref().user_display().to_string();
-
-    // Wrap the executable in quotes (and a `&` invocation on PowerShell), if it contains spaces.
-    if executable.contains(' ') {
-        if shell == Shell::Powershell {
-            // For PowerShell, wrap in a `&` invocation.
-            format!("& \"{executable}\"")
-        } else {
-            // Otherwise, assume `cmd`, which doesn't need the `&`.
-            format!("\"{executable}\"")
-        }
-    } else {
-        executable
-    }
 }

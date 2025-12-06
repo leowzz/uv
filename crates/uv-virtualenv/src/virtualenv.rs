@@ -5,15 +5,20 @@ use std::io;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use fs_err as fs;
+use console::Term;
 use fs_err::File;
 use itertools::Itertools;
-use tracing::info;
+use owo_colors::OwoColorize;
+use tracing::{debug, trace};
 
-use pypi_types::Scheme;
-use uv_fs::{cachedir, Simplified, CWD};
+use uv_fs::{CWD, Simplified, cachedir};
+use uv_preview::Preview;
+use uv_pypi_types::Scheme;
+use uv_python::managed::{PythonMinorVersionLink, create_link_to_executable};
 use uv_python::{Interpreter, VirtualEnvironment};
+use uv_shell::escape_posix_for_single_quotes;
 use uv_version::version;
+use uv_warnings::warn_user_once;
 
 use crate::{Error, Prompt};
 
@@ -43,83 +48,148 @@ fn write_cfg(f: &mut impl Write, data: &[(String, String)]) -> io::Result<()> {
 }
 
 /// Create a [`VirtualEnvironment`] at the given location.
+#[allow(clippy::fn_params_excessive_bools)]
 pub(crate) fn create(
     location: &Path,
     interpreter: &Interpreter,
     prompt: Prompt,
     system_site_packages: bool,
-    allow_existing: bool,
+    on_existing: OnExisting,
     relocatable: bool,
+    seed: bool,
+    upgradeable: bool,
+    preview: Preview,
 ) -> Result<VirtualEnvironment, Error> {
     // Determine the base Python executable; that is, the Python executable that should be
-    // considered the "base" for the virtual environment. This is typically the Python executable
-    // from the [`Interpreter`]; however, if the interpreter is a virtual environment itself, then
-    // the base Python executable is the Python executable of the interpreter's base interpreter.
-    let base_python = if cfg!(unix) {
-        // On Unix, follow symlinks to resolve the base interpreter, since the Python executable in
-        // a virtual environment is a symlink to the base interpreter.
-        uv_fs::canonicalize_executable(interpreter.sys_executable())?
-    } else if cfg!(windows) {
-        // On Windows, follow `virtualenv`. If we're in a virtual environment, use
-        // `sys._base_executable` if it exists; if not, use `sys.base_prefix`. For example, with
-        // Python installed from the Windows Store, `sys.base_prefix` is slightly "incorrect".
-        //
-        // If we're _not_ in a virtual environment, use the interpreter's executable, since it's
-        // already a "system Python". We canonicalize the path to ensure that it's real and
-        // consistent, though we don't expect any symlinks on Windows.
-        if interpreter.is_virtualenv() {
-            if let Some(base_executable) = interpreter.sys_base_executable() {
-                base_executable.to_path_buf()
-            } else {
-                // Assume `python.exe`, though the exact executable name is never used (below) on
-                // Windows, only its parent directory.
-                interpreter.sys_base_prefix().join("python.exe")
-            }
-        } else {
-            interpreter.sys_executable().to_path_buf()
-        }
+    // considered the "base" for the virtual environment.
+    //
+    // For consistency with the standard library, rely on `sys._base_executable`, _unless_ we're
+    // using a uv-managed Python (in which case, we can do better for symlinked executables).
+    let base_python = if cfg!(unix) && interpreter.is_standalone() {
+        interpreter.find_base_python()?
     } else {
-        unimplemented!("Only Windows and Unix are supported")
+        interpreter.to_base_python()?
     };
+
+    debug!(
+        "Using base executable for virtual environment: {}",
+        base_python.display()
+    );
+
+    // Extract the prompt and compute the absolute path prior to validating the location; otherwise,
+    // we risk deleting (and recreating) the current working directory, which would cause the `CWD`
+    // queries to fail.
+    let prompt = match prompt {
+        Prompt::CurrentDirectoryName => CWD
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string()),
+        Prompt::Static(value) => Some(value),
+        Prompt::None => None,
+    };
+    let absolute = std::path::absolute(location)?;
 
     // Validate the existing location.
     match location.metadata() {
-        Ok(metadata) => {
-            if metadata.is_file() {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("File exists at `{}`", location.user_display()),
-                )));
-            } else if metadata.is_dir() {
-                if allow_existing {
-                    info!("Allowing existing directory");
-                } else if location.join("pyvenv.cfg").is_file() {
-                    info!("Removing existing directory");
-                    fs::remove_dir_all(location)?;
-                    fs::create_dir_all(location)?;
-                } else if location
+        Ok(metadata) if metadata.is_file() => {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("File exists at `{}`", location.user_display()),
+            )));
+        }
+        Ok(metadata)
+            if metadata.is_dir()
+                && location
                     .read_dir()
-                    .is_ok_and(|mut dir| dir.next().is_none())
-                {
-                    info!("Ignoring empty directory");
-                } else {
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "The directory `{}` exists, but it's not a virtualenv",
-                            location.user_display()
-                        ),
-                    )));
+                    .is_ok_and(|mut dir| dir.next().is_none()) =>
+        {
+            // If it's an empty directory, we can proceed
+            trace!(
+                "Using empty directory at `{}` for virtual environment",
+                location.user_display()
+            );
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            let is_virtualenv = uv_fs::is_virtualenv_base(location);
+            let name = if is_virtualenv {
+                "virtual environment"
+            } else {
+                "directory"
+            };
+            let hint = format!(
+                "Use the `{}` flag or set `{}` to replace the existing {name}",
+                "--clear".green(),
+                "UV_VENV_CLEAR=1".green()
+            );
+            // TODO(zanieb): We may want to consider omitting the hint in some of these cases, e.g.,
+            // when `--no-clear` is used do we want to suggest `--clear`?
+            let err = Err(Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "A {name} already exists at: {}\n\n{}{} {hint}",
+                    location.user_display(),
+                    "hint".bold().cyan(),
+                    ":".bold(),
+                ),
+            )));
+            match on_existing {
+                OnExisting::Allow => {
+                    debug!("Allowing existing {name} due to `--allow-existing`");
+                }
+                OnExisting::Remove(reason) => {
+                    debug!("Removing existing {name} ({reason})");
+                    // Before removing the virtual environment, we need to canonicalize the path
+                    // because `Path::metadata` will follow the symlink but we're still operating on
+                    // the unresolved path and will remove the symlink itself.
+                    let location = location
+                        .canonicalize()
+                        .unwrap_or_else(|_| location.to_path_buf());
+                    remove_virtualenv(&location)?;
+                    fs_err::create_dir_all(&location)?;
+                }
+                OnExisting::Fail => return err,
+                // If not a virtual environment, fail without prompting.
+                OnExisting::Prompt if !is_virtualenv => return err,
+                OnExisting::Prompt => {
+                    match confirm_clear(location, name)? {
+                        Some(true) => {
+                            debug!("Removing existing {name} due to confirmation");
+                            // Before removing the virtual environment, we need to canonicalize the
+                            // path because `Path::metadata` will follow the symlink but we're still
+                            // operating on the unresolved path and will remove the symlink itself.
+                            let location = location
+                                .canonicalize()
+                                .unwrap_or_else(|_| location.to_path_buf());
+                            remove_virtualenv(&location)?;
+                            fs_err::create_dir_all(&location)?;
+                        }
+                        Some(false) => return err,
+                        // When we don't have a TTY, warn that the behavior will change in the future
+                        None => {
+                            warn_user_once!(
+                                "A {name} already exists at `{}`. In the future, uv will require `{}` to replace it",
+                                location.user_display(),
+                                "--clear".green(),
+                            );
+                        }
+                    }
                 }
             }
         }
+        Ok(_) => {
+            // It's not a file or a directory
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Object already exists at `{}`", location.user_display()),
+            )));
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(location)?;
+            fs_err::create_dir_all(location)?;
         }
         Err(err) => return Err(Error::Io(err)),
     }
 
-    let location = location.canonicalize()?;
+    // Use the absolute path for all further operations.
+    let location = absolute;
 
     let bin_name = if cfg!(unix) {
         "bin"
@@ -129,35 +199,66 @@ pub(crate) fn create(
         unimplemented!("Only Windows and Unix are supported")
     };
     let scripts = location.join(&interpreter.virtualenv().scripts);
-    let prompt = match prompt {
-        Prompt::CurrentDirectoryName => CWD
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string()),
-        Prompt::Static(value) => Some(value),
-        Prompt::None => None,
-    };
 
     // Add the CACHEDIR.TAG.
     cachedir::ensure_tag(&location)?;
 
     // Create a `.gitignore` file to ignore all files in the venv.
-    fs::write(location.join(".gitignore"), "*")?;
+    fs_err::write(location.join(".gitignore"), "*")?;
+
+    let mut using_minor_version_link = false;
+    let executable_target = if upgradeable && interpreter.is_standalone() {
+        if let Some(minor_version_link) = PythonMinorVersionLink::from_executable(
+            base_python.as_path(),
+            &interpreter.key(),
+            preview,
+        ) {
+            if !minor_version_link.exists() {
+                base_python.clone()
+            } else {
+                let debug_symlink_term = if cfg!(windows) {
+                    "junction"
+                } else {
+                    "symlink directory"
+                };
+                debug!(
+                    "Using {} {} instead of base Python path: {}",
+                    debug_symlink_term,
+                    &minor_version_link.symlink_directory.display(),
+                    &base_python.display()
+                );
+                using_minor_version_link = true;
+                minor_version_link.symlink_executable.clone()
+            }
+        } else {
+            base_python.clone()
+        }
+    } else {
+        base_python.clone()
+    };
 
     // Per PEP 405, the Python `home` is the parent directory of the interpreter.
-    let python_home = base_python.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "The Python interpreter needs to have a parent directory",
-        )
-    })?;
+    // In preview mode, for standalone interpreters, this `home` value will include a
+    // symlink directory on Unix or junction on Windows to enable transparent Python patch
+    // upgrades.
+    let python_home = executable_target
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "The Python interpreter needs to have a parent directory",
+            )
+        })?
+        .to_path_buf();
+    let python_home = python_home.as_path();
 
     // Different names for the python interpreter
-    fs::create_dir_all(&scripts)?;
+    fs_err::create_dir_all(&scripts)?;
     let executable = scripts.join(format!("python{EXE_SUFFIX}"));
 
     #[cfg(unix)]
     {
-        uv_fs::replace_symlink(&base_python, &executable)?;
+        uv_fs::replace_symlink(&executable_target, &executable)?;
         uv_fs::replace_symlink(
             "python",
             scripts.join(format!("python{}", interpreter.python_major())),
@@ -170,6 +271,16 @@ pub(crate) fn create(
                 interpreter.python_minor(),
             )),
         )?;
+        if interpreter.gil_disabled() {
+            uv_fs::replace_symlink(
+                "python",
+                scripts.join(format!(
+                    "python{}.{}t",
+                    interpreter.python_major(),
+                    interpreter.python_minor(),
+                )),
+            )?;
+        }
 
         if interpreter.markers().implementation_name() == "pypy" {
             uv_fs::replace_symlink(
@@ -184,91 +295,141 @@ pub(crate) fn create(
         }
     }
 
-    // No symlinking on Windows, at least not on a regular non-dev non-admin Windows install.
+    // On Windows, we use trampolines that point to an executable target. For standalone
+    // interpreters, this target path includes a minor version junction to enable
+    // transparent upgrades.
     if cfg!(windows) {
-        copy_launcher_windows(
-            WindowsExecutable::Python,
-            interpreter,
-            &base_python,
-            &scripts,
-            python_home,
-        )?;
-
-        if interpreter.markers().implementation_name() == "graalpy" {
-            copy_launcher_windows(
-                WindowsExecutable::GraalPy,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
-            copy_launcher_windows(
-                WindowsExecutable::PythonMajor,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
+        if using_minor_version_link {
+            let target = scripts.join(WindowsExecutable::Python.exe(interpreter));
+            create_link_to_executable(target.as_path(), &executable_target)
+                .map_err(Error::Python)?;
+            let targetw = scripts.join(WindowsExecutable::Pythonw.exe(interpreter));
+            create_link_to_executable(targetw.as_path(), &executable_target)
+                .map_err(Error::Python)?;
+            if interpreter.gil_disabled() {
+                let targett = scripts.join(WindowsExecutable::PythonMajorMinort.exe(interpreter));
+                create_link_to_executable(targett.as_path(), &executable_target)
+                    .map_err(Error::Python)?;
+                let targetwt = scripts.join(WindowsExecutable::PythonwMajorMinort.exe(interpreter));
+                create_link_to_executable(targetwt.as_path(), &executable_target)
+                    .map_err(Error::Python)?;
+            }
         } else {
+            // Always copy `python.exe`.
             copy_launcher_windows(
-                WindowsExecutable::Pythonw,
+                WindowsExecutable::Python,
                 interpreter,
                 &base_python,
                 &scripts,
                 python_home,
             )?;
-        }
 
-        if interpreter.markers().implementation_name() == "pypy" {
-            copy_launcher_windows(
-                WindowsExecutable::PythonMajor,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
-            copy_launcher_windows(
-                WindowsExecutable::PythonMajorMinor,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
-            copy_launcher_windows(
-                WindowsExecutable::PyPy,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
-            copy_launcher_windows(
-                WindowsExecutable::PyPyMajor,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
-            copy_launcher_windows(
-                WindowsExecutable::PyPyMajorMinor,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
-            copy_launcher_windows(
-                WindowsExecutable::PyPyw,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
-            copy_launcher_windows(
-                WindowsExecutable::PyPyMajorMinorw,
-                interpreter,
-                &base_python,
-                &scripts,
-                python_home,
-            )?;
+            match interpreter.implementation_name() {
+                "graalpy" => {
+                    // For GraalPy, copy `graalpy.exe` and `python3.exe`.
+                    copy_launcher_windows(
+                        WindowsExecutable::GraalPy,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                    copy_launcher_windows(
+                        WindowsExecutable::PythonMajor,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                }
+                "pypy" => {
+                    // For PyPy, copy all versioned executables and all PyPy-specific executables.
+                    copy_launcher_windows(
+                        WindowsExecutable::PythonMajor,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                    copy_launcher_windows(
+                        WindowsExecutable::PythonMajorMinor,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                    copy_launcher_windows(
+                        WindowsExecutable::Pythonw,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                    copy_launcher_windows(
+                        WindowsExecutable::PyPy,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                    copy_launcher_windows(
+                        WindowsExecutable::PyPyMajor,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                    copy_launcher_windows(
+                        WindowsExecutable::PyPyMajorMinor,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                    copy_launcher_windows(
+                        WindowsExecutable::PyPyw,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                    copy_launcher_windows(
+                        WindowsExecutable::PyPyMajorMinorw,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+                }
+                _ => {
+                    // For all other interpreters, copy `pythonw.exe`.
+                    copy_launcher_windows(
+                        WindowsExecutable::Pythonw,
+                        interpreter,
+                        &base_python,
+                        &scripts,
+                        python_home,
+                    )?;
+
+                    // If the GIL is disabled, copy `venvlaunchert.exe` and `venvwlaunchert.exe`.
+                    if interpreter.gil_disabled() {
+                        copy_launcher_windows(
+                            WindowsExecutable::PythonMajorMinort,
+                            interpreter,
+                            &base_python,
+                            &scripts,
+                            python_home,
+                        )?;
+                        copy_launcher_windows(
+                            WindowsExecutable::PythonwMajorMinort,
+                            interpreter,
+                            &base_python,
+                            &scripts,
+                            python_home,
+                        )?;
+                    }
+                }
+            }
         }
     }
 
@@ -296,25 +457,20 @@ pub(crate) fn create(
 
         let virtual_env_dir = match (relocatable, name.to_owned()) {
             (true, "activate") => {
-                // Extremely verbose, but should cover all major POSIX shells,
-                // as well as platforms where `readlink` does not implement `-f`.
-                r#"'"$(dirname -- "$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" > /dev/null && echo "$PWD")")"'"#
+                r#"'"$(dirname -- "$(dirname -- "$(realpath -- "$SCRIPT_PATH")")")"'"#.to_string()
             }
-            (true, "activate.bat") => r"%~dp0..",
+            (true, "activate.bat") => r"%~dp0..".to_string(),
             (true, "activate.fish") => {
-                r#"'"$(dirname -- "$(cd "$(dirname -- "$(status -f)")"; and pwd)")"'"#
+                r#"'"$(dirname -- "$(cd "$(dirname -- "$(status -f)")"; and pwd)")"'"#.to_string()
             }
             // Note:
             // * relocatable activate scripts appear not to be possible in csh and nu shell
             // * `activate.ps1` is already relocatable by default.
-            _ => {
-                // SAFETY: `unwrap` is guaranteed to succeed because `location` is an `Utf8PathBuf`.
-                location.simplified().to_str().unwrap()
-            }
+            _ => escape_posix_for_single_quotes(location.simplified().to_str().unwrap()),
         };
 
         let activator = template
-            .replace("{{ VIRTUAL_ENV_DIR }}", virtual_env_dir)
+            .replace("{{ VIRTUAL_ENV_DIR }}", &virtual_env_dir)
             .replace("{{ BIN_NAME }}", bin_name)
             .replace(
                 "{{ VIRTUAL_PROMPT }}",
@@ -322,7 +478,7 @@ pub(crate) fn create(
             )
             .replace("{{ PATH_SEP }}", path_sep)
             .replace("{{ RELATIVE_SITE_PACKAGES }}", &relative_site_packages);
-        fs::write(scripts.join(name), activator)?;
+        fs_err::write(scripts.join(name), activator)?;
     }
 
     let mut pyvenv_cfg_data: Vec<(String, String)> = vec![
@@ -350,15 +506,15 @@ pub(crate) fn create(
                 "false".to_string()
             },
         ),
-        (
-            "relocatable".to_string(),
-            if relocatable {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            },
-        ),
     ];
+
+    if relocatable {
+        pyvenv_cfg_data.push(("relocatable".to_string(), "true".to_string()));
+    }
+
+    if seed {
+        pyvenv_cfg_data.push(("seed".to_string(), "true".to_string()));
+    }
 
     if let Some(prompt) = prompt {
         pyvenv_cfg_data.push(("prompt".to_string(), prompt));
@@ -380,7 +536,7 @@ pub(crate) fn create(
 
     // Construct the path to the `site-packages` directory.
     let site_packages = location.join(&interpreter.virtualenv().purelib);
-    fs::create_dir_all(&site_packages)?;
+    fs_err::create_dir_all(&site_packages)?;
 
     // If necessary, create a symlink from `lib64` to `lib`.
     // See: https://github.com/python/cpython/blob/b228655c227b2ca298a8ffac44d14ce3d22f6faa/Lib/venv/__init__.py#L135C11-L135C16
@@ -389,7 +545,7 @@ pub(crate) fn create(
         && interpreter.markers().os_name() == "posix"
         && interpreter.markers().sys_platform() != "darwin"
     {
-        match std::os::unix::fs::symlink("lib", location.join("lib64")) {
+        match fs_err::os::unix::fs::symlink("lib", location.join("lib64")) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => {
@@ -399,8 +555,8 @@ pub(crate) fn create(
     }
 
     // Populate `site-packages` with a `_virtualenv.py` file.
-    fs::write(site_packages.join("_virtualenv.py"), VIRTUALENV_PATCH)?;
-    fs::write(site_packages.join("_virtualenv.pth"), "import _virtualenv")?;
+    fs_err::write(site_packages.join("_virtualenv.py"), VIRTUALENV_PATCH)?;
+    fs_err::write(site_packages.join("_virtualenv.pth"), "import _virtualenv")?;
 
     Ok(VirtualEnvironment {
         scheme: Scheme {
@@ -412,7 +568,135 @@ pub(crate) fn create(
         },
         root: location,
         executable,
+        base_executable: base_python,
     })
+}
+
+/// Prompt a confirmation that the virtual environment should be cleared.
+///
+/// If not a TTY, returns `None`.
+fn confirm_clear(location: &Path, name: &'static str) -> Result<Option<bool>, io::Error> {
+    let term = Term::stderr();
+    if term.is_term() {
+        let prompt = format!(
+            "A {name} already exists at `{}`. Do you want to replace it?",
+            location.user_display(),
+        );
+        let hint = format!(
+            "Use the `{}` flag or set `{}` to skip this prompt",
+            "--clear".green(),
+            "UV_VENV_CLEAR=1".green()
+        );
+        Ok(Some(uv_console::confirm_with_hint(
+            &prompt, &hint, &term, true,
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Perform a safe removal of a virtual environment.
+pub fn remove_virtualenv(location: &Path) -> Result<(), Error> {
+    // On Windows, if the current executable is in the directory, defer self-deletion since Windows
+    // won't let you unlink a running executable.
+    #[cfg(windows)]
+    if let Ok(itself) = std::env::current_exe() {
+        let target = std::path::absolute(location)?;
+        if itself.starts_with(&target) {
+            debug!("Detected self-delete of executable: {}", itself.display());
+            self_replace::self_delete_outside_path(location)?;
+        }
+    }
+
+    // We defer removal of the `pyvenv.cfg` until the end, so if we fail to remove the environment,
+    // uv can still identify it as a Python virtual environment that can be deleted.
+    for entry in fs_err::read_dir(location)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == location.join("pyvenv.cfg") {
+            continue;
+        }
+        if path.is_dir() {
+            fs_err::remove_dir_all(&path)?;
+        } else {
+            fs_err::remove_file(&path)?;
+        }
+    }
+
+    match fs_err::remove_file(location.join("pyvenv.cfg")) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    // Remove the virtual environment directory itself
+    match fs_err::remove_dir_all(location) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        // If the virtual environment is a mounted file system, e.g., in a Docker container, we
+        // cannot delete it — but that doesn't need to be a fatal error
+        Err(err) if err.kind() == io::ErrorKind::ResourceBusy => {
+            debug!(
+                "Skipping removal of `{}` directory due to {err}",
+                location.display(),
+            );
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RemovalReason {
+    /// The removal was explicitly requested, i.e., with `--clear`.
+    UserRequest,
+    /// The environment can be removed because it is considered temporary, e.g., a build
+    /// environment.
+    TemporaryEnvironment,
+    /// The environment can be removed because it is managed by uv, e.g., a project or tool
+    /// environment.
+    ManagedEnvironment,
+}
+
+impl std::fmt::Display for RemovalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserRequest => f.write_str("requested with `--clear`"),
+            Self::ManagedEnvironment => f.write_str("environment is managed by uv"),
+            Self::TemporaryEnvironment => f.write_str("environment is temporary"),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub enum OnExisting {
+    /// Prompt before removing an existing directory.
+    ///
+    /// If a TTY is not available, fail.
+    #[default]
+    Prompt,
+    /// Fail if the directory already exists and is non-empty.
+    Fail,
+    /// Allow an existing directory, overwriting virtual environment files while retaining other
+    /// files in the directory.
+    Allow,
+    /// Remove an existing directory.
+    Remove(RemovalReason),
+}
+
+impl OnExisting {
+    pub fn from_args(allow_existing: bool, clear: bool, no_clear: bool) -> Self {
+        if allow_existing {
+            Self::Allow
+        } else if clear {
+            Self::Remove(RemovalReason::UserRequest)
+        } else if no_clear {
+            Self::Fail
+        } else {
+            Self::Prompt
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -423,8 +707,12 @@ enum WindowsExecutable {
     PythonMajor,
     /// The `python3.<minor>.exe` executable (or `venvlauncher.exe` launcher shim).
     PythonMajorMinor,
+    /// The `python3.<minor>t.exe` executable (or `venvlaunchert.exe` launcher shim).
+    PythonMajorMinort,
     /// The `pythonw.exe` executable (or `venvwlauncher.exe` launcher shim).
     Pythonw,
+    /// The `pythonw3.<minor>t.exe` executable (or `venvwlaunchert.exe` launcher shim).
+    PythonwMajorMinort,
     /// The `pypy.exe` executable.
     PyPy,
     /// The `pypy3.exe` executable.
@@ -435,7 +723,7 @@ enum WindowsExecutable {
     PyPyw,
     /// The `pypy3.<minor>w.exe` executable.
     PyPyMajorMinorw,
-    // The `graalpy.exe` executable
+    /// The `graalpy.exe` executable.
     GraalPy,
 }
 
@@ -443,56 +731,73 @@ impl WindowsExecutable {
     /// The name of the Python executable.
     fn exe(self, interpreter: &Interpreter) -> String {
         match self {
-            WindowsExecutable::Python => String::from("python.exe"),
-            WindowsExecutable::PythonMajor => {
+            Self::Python => String::from("python.exe"),
+            Self::PythonMajor => {
                 format!("python{}.exe", interpreter.python_major())
             }
-            WindowsExecutable::PythonMajorMinor => {
+            Self::PythonMajorMinor => {
                 format!(
                     "python{}.{}.exe",
                     interpreter.python_major(),
                     interpreter.python_minor()
                 )
             }
-            WindowsExecutable::Pythonw => String::from("pythonw.exe"),
-            WindowsExecutable::PyPy => String::from("pypy.exe"),
-            WindowsExecutable::PyPyMajor => {
+            Self::PythonMajorMinort => {
+                format!(
+                    "python{}.{}t.exe",
+                    interpreter.python_major(),
+                    interpreter.python_minor()
+                )
+            }
+            Self::Pythonw => String::from("pythonw.exe"),
+            Self::PythonwMajorMinort => {
+                format!(
+                    "pythonw{}.{}t.exe",
+                    interpreter.python_major(),
+                    interpreter.python_minor()
+                )
+            }
+            Self::PyPy => String::from("pypy.exe"),
+            Self::PyPyMajor => {
                 format!("pypy{}.exe", interpreter.python_major())
             }
-            WindowsExecutable::PyPyMajorMinor => {
+            Self::PyPyMajorMinor => {
                 format!(
                     "pypy{}.{}.exe",
                     interpreter.python_major(),
                     interpreter.python_minor()
                 )
             }
-            WindowsExecutable::PyPyw => String::from("pypyw.exe"),
-            WindowsExecutable::PyPyMajorMinorw => {
+            Self::PyPyw => String::from("pypyw.exe"),
+            Self::PyPyMajorMinorw => {
                 format!(
                     "pypy{}.{}w.exe",
                     interpreter.python_major(),
                     interpreter.python_minor()
                 )
             }
-            WindowsExecutable::GraalPy => String::from("graalpy.exe"),
+            Self::GraalPy => String::from("graalpy.exe"),
         }
     }
 
     /// The name of the launcher shim.
-    fn launcher(self) -> &'static str {
+    fn launcher(self, interpreter: &Interpreter) -> &'static str {
         match self {
-            WindowsExecutable::Python => "venvlauncher.exe",
-            WindowsExecutable::PythonMajor => "venvlauncher.exe",
-            WindowsExecutable::PythonMajorMinor => "venvlauncher.exe",
-            WindowsExecutable::Pythonw => "venvwlauncher.exe",
+            Self::Python | Self::PythonMajor | Self::PythonMajorMinor
+                if interpreter.gil_disabled() =>
+            {
+                "venvlaunchert.exe"
+            }
+            Self::Python | Self::PythonMajor | Self::PythonMajorMinor => "venvlauncher.exe",
+            Self::Pythonw if interpreter.gil_disabled() => "venvwlaunchert.exe",
+            Self::Pythonw => "venvwlauncher.exe",
+            Self::PythonMajorMinort => "venvlaunchert.exe",
+            Self::PythonwMajorMinort => "venvwlaunchert.exe",
             // From 3.13 on these should replace the `python.exe` and `pythonw.exe` shims.
             // These are not relevant as of now for PyPy as it doesn't yet support Python 3.13.
-            WindowsExecutable::PyPy => "venvlauncher.exe",
-            WindowsExecutable::PyPyMajor => "venvlauncher.exe",
-            WindowsExecutable::PyPyMajorMinor => "venvlauncher.exe",
-            WindowsExecutable::PyPyw => "venvwlauncher.exe",
-            WindowsExecutable::PyPyMajorMinorw => "venvwlauncher.exe",
-            WindowsExecutable::GraalPy => "venvlauncher.exe",
+            Self::PyPy | Self::PyPyMajor | Self::PyPyMajorMinor => "venvlauncher.exe",
+            Self::PyPyw | Self::PyPyMajorMinorw => "venvwlauncher.exe",
+            Self::GraalPy => "venvlauncher.exe",
         }
     }
 }
@@ -532,7 +837,7 @@ fn copy_launcher_windows(
         .join("venv")
         .join("scripts")
         .join("nt")
-        .join(executable.launcher());
+        .join(executable.launcher(interpreter));
     match fs_err::copy(shim, scripts.join(executable.exe(interpreter))) {
         Ok(_) => return Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -543,7 +848,7 @@ fn copy_launcher_windows(
 
     // Third priority: on Conda at least, we can look for the launcher shim next to
     // the Python executable itself.
-    let shim = base_python.with_file_name(executable.launcher());
+    let shim = base_python.with_file_name(executable.launcher(interpreter));
     match fs_err::copy(shim, scripts.join(executable.exe(interpreter))) {
         Ok(_) => return Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -608,7 +913,7 @@ fn copy_launcher_windows(
                 Err(err) => {
                     return Err(err.into());
                 }
-            };
+            }
 
             return Ok(());
         }

@@ -3,19 +3,34 @@ use std::cmp::max;
 use std::path::PathBuf;
 
 use anstream::println;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Command, CommandFactory};
 use itertools::Itertools;
 use pretty_assertions::StrComparison;
 
-use crate::generate_all::Mode;
 use crate::ROOT_DIR;
+use crate::generate_all::Mode;
 
 use uv_cli::Cli;
 
+const REPLACEMENTS: &[(&str, &str)] = &[
+    // Replace suggestions to use `uv help python` with a link to the
+    // `uv python` section
+    (
+        "<code>uv help python</code>",
+        "<a href=\"#uv-python\">uv python</a>",
+    ),
+    // Drop the manually included `env` section for `--no-python-downloads`
+    // TODO(zanieb): In general, we should show all of the environment variables in the reference
+    // but this one is non-standard so it's the only one included right now. When we tackle the rest
+    // we can fix the formatting.
+    (" [env: &quot;UV_PYTHON_DOWNLOADS=never&quot;]", ""),
+];
+
+const SHOW_HIDDEN_COMMANDS: &[&str] = &["generate-shell-completion"];
+
 #[derive(clap::Args)]
 pub(crate) struct Args {
-    /// Write the generated output to stdout (rather than to `settings.md`).
     #[arg(long, default_value_t, value_enum)]
     pub(crate) mode: Mode,
 }
@@ -38,7 +53,9 @@ pub(crate) fn main(args: &Args) -> Result<()> {
                     println!("Up-to-date: {filename}");
                 } else {
                     let comparison = StrComparison::new(&current, &reference_string);
-                    bail!("{filename} changed, please run `cargo dev generate-cli-reference`:\n{comparison}");
+                    bail!(
+                        "{filename} changed, please run `cargo dev generate-cli-reference`:\n{comparison}"
+                    );
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -84,11 +101,23 @@ fn generate() -> String {
     output.push_str("# CLI Reference\n\n");
     generate_command(&mut output, &uv, &mut parents);
 
+    for (value, replacement) in REPLACEMENTS {
+        assert_ne!(
+            value, replacement,
+            "`value` and `replacement` must be different, but both are `{value}`"
+        );
+        let before = &output;
+        let after = output.replace(value, replacement);
+        assert_ne!(*before, after, "Could not find `{value}` in the output");
+        output = after;
+    }
+
     output
 }
 
+#[allow(clippy::format_push_string)]
 fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut Vec<&'a Command>) {
-    if command.is_hide_set() {
+    if command.is_hide_set() && !SHOW_HIDDEN_COMMANDS.contains(&command.get_name()) {
         return;
     }
 
@@ -111,7 +140,7 @@ fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut
     if let Some(about) = command.get_long_about().or_else(|| command.get_about()) {
         output.push_str(&about.to_string());
         output.push_str("\n\n");
-    };
+    }
 
     // Display the usage
     {
@@ -159,6 +188,8 @@ fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut
 
     // Do not display options for commands with children
     if !has_subcommands {
+        let name_key = name.replace(' ', "-");
+
         // Display positional arguments
         let mut arguments = command
             .get_positionals()
@@ -170,10 +201,11 @@ fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut
             output.push_str("<dl class=\"cli-reference\">");
 
             for arg in arguments {
-                output.push_str("<dt>");
+                let id = format!("{name_key}--{}", arg.get_id());
+                output.push_str(&format!("<dt id=\"{id}\">"));
                 output.push_str(&format!(
-                    "<code>{}</code>",
-                    arg.get_id().to_string().to_uppercase()
+                    "<a href=\"#{id}\"<code>{}</code></a>",
+                    arg.get_id().to_string().to_uppercase(),
                 ));
                 output.push_str("</dt>");
                 if let Some(help) = arg.get_long_help().or_else(|| arg.get_help()) {
@@ -186,40 +218,53 @@ fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut
             output.push_str("</dl>\n\n");
         }
 
-        // Display options
+        // Display options and flags
         let mut options = command
-            .get_opts()
+            .get_arguments()
+            .filter(|arg| !arg.is_positional())
             .filter(|arg| !arg.is_hide_set())
-            .sorted_by_key(|opt| opt.get_id())
+            .sorted_by_key(|arg| arg.get_id())
             .peekable();
 
         if options.peek().is_some() {
             output.push_str("<h3 class=\"cli-reference\">Options</h3>\n\n");
             output.push_str("<dl class=\"cli-reference\">");
-            for opt in command.get_opts() {
-                if opt.is_hide_set() {
-                    continue;
-                }
-
+            for opt in options {
                 let Some(long) = opt.get_long() else { continue };
+                let id = format!("{name_key}--{long}");
 
-                output.push_str("<dt>");
-                output.push_str(&format!("<code>--{long}</code>"));
+                output.push_str(&format!("<dt id=\"{id}\">"));
+                output.push_str(&format!("<a href=\"#{id}\"><code>--{long}</code></a>"));
+                for long_alias in opt.get_all_aliases().into_iter().flatten() {
+                    output.push_str(&format!(", <code>--{long_alias}</code>"));
+                }
                 if let Some(short) = opt.get_short() {
                     output.push_str(&format!(", <code>-{short}</code>"));
                 }
-                if let Some(values) = opt.get_value_names() {
-                    for value in values {
-                        output.push_str(&format!(
-                            " <i>{}</i>",
-                            value.to_lowercase().replace('_', "-")
-                        ));
+                for short_alias in opt.get_all_short_aliases().into_iter().flatten() {
+                    output.push_str(&format!(", <code>-{short_alias}</code>"));
+                }
+
+                // Re-implements private `Arg::is_takes_value_set` used in `Command::get_opts`
+                if opt
+                    .get_num_args()
+                    .unwrap_or_else(|| 1.into())
+                    .takes_values()
+                {
+                    if let Some(values) = opt.get_value_names() {
+                        for value in values {
+                            output.push_str(&format!(
+                                " <i>{}</i>",
+                                value.to_lowercase().replace('_', "-")
+                            ));
+                        }
                     }
                 }
                 output.push_str("</dt>");
                 if let Some(help) = opt.get_long_help().or_else(|| opt.get_help()) {
                     output.push_str("<dd>");
                     output.push_str(&format!("{}\n", markdown::to_html(&help.to_string())));
+                    emit_env_option(opt, output);
                     emit_default_option(opt, output);
                     emit_possible_options(opt, output);
                     output.push_str("</dd>");
@@ -240,6 +285,18 @@ fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut
     }
 
     parents.pop();
+}
+
+fn emit_env_option(opt: &clap::Arg, output: &mut String) {
+    if opt.is_hide_env_set() {
+        return;
+    }
+    if let Some(env) = opt.get_env() {
+        output.push_str(&markdown::to_html(&format!(
+            "May also be set with the `{}` environment variable.",
+            env.to_string_lossy()
+        )));
+    }
 }
 
 fn emit_default_option(opt: &clap::Arg, output: &mut String) {
@@ -271,6 +328,7 @@ fn emit_possible_options(opt: &clap::Arg, output: &mut String) {
             "\nPossible values:\n{}",
             values
                 .into_iter()
+                .filter(|value| !value.is_hide_set())
                 .map(|value| {
                     let name = value.get_name();
                     value.get_help().map_or_else(
@@ -291,13 +349,20 @@ mod tests {
 
     use anyhow::Result;
 
+    use uv_static::EnvVars;
+
     use crate::generate_all::Mode;
 
-    use super::{main, Args};
+    use super::{Args, main};
 
     #[test]
     fn test_generate_cli_reference() -> Result<()> {
-        let mode = if env::var("UV_UPDATE_SCHEMA").as_deref() == Ok("1") {
+        // Skip this test in CI to avoid redundancy with the dedicated CI job
+        if env::var_os(EnvVars::CI).is_some() {
+            return Ok(());
+        }
+
+        let mode = if env::var(EnvVars::UV_UPDATE_SCHEMA).as_deref() == Ok("1") {
             Mode::Write
         } else {
             Mode::Check

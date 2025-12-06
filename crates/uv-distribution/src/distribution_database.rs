@@ -2,7 +2,6 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -11,27 +10,27 @@ use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncSeekExt, ReadBuf};
 use tokio::sync::Semaphore;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use tracing::{debug, info_span, instrument, warn, Instrument};
+use tracing::{Instrument, info_span, instrument, warn};
 use url::Url;
 
-use distribution_filename::WheelFilename;
-use distribution_types::{
-    BuildableSource, BuiltDist, Dist, FileLocation, HashPolicy, Hashed, IndexLocations, Name,
-    SourceDist,
-};
-use platform_tags::Tags;
-use pypi_types::HashDigest;
-use uv_cache::{ArchiveId, ArchiveTimestamp, CacheBucket, CacheEntry, Timestamp, WheelCache};
+use uv_cache::{ArchiveId, CacheBucket, CacheEntry, WheelCache};
+use uv_cache_info::{CacheInfo, Timestamp};
 use uv_client::{
     CacheControl, CachedClientError, Connectivity, DataWithCachePolicy, RegistryClient,
 };
-use uv_configuration::PreviewMode;
+use uv_distribution_filename::WheelFilename;
+use uv_distribution_types::{
+    BuildInfo, BuildableSource, BuiltDist, Dist, File, HashPolicy, Hashed, IndexUrl, InstalledDist,
+    Name, SourceDist, ToUrlError,
+};
 use uv_extract::hash::Hasher;
 use uv_fs::write_atomic;
-use uv_types::BuildContext;
+use uv_platform_tags::Tags;
+use uv_pypi_types::{HashDigest, HashDigests, PyProjectToml};
+use uv_redacted::DisplaySafeUrl;
+use uv_types::{BuildContext, BuildStack};
 
 use crate::archive::Archive;
-use crate::locks::Locks;
 use crate::metadata::{ArchiveMetadata, Metadata};
 use crate::source::SourceDistributionBuilder;
 use crate::{Error, LocalWheel, Reporter, RequiresDist};
@@ -43,15 +42,14 @@ use crate::{Error, LocalWheel, Reporter, RequiresDist};
 /// building the source distribution. For wheel files, either the wheel is downloaded or a source
 /// distribution is downloaded, built and the new wheel gets returned.
 ///
-/// All kinds of wheel sources (index, url, path) and source distribution source (index, url, path,
-/// git) are supported.
+/// All kinds of wheel sources (index, URL, path) and source distribution source (index, URL, path,
+/// Git) are supported.
 ///
 /// This struct also has the task of acquiring locks around source dist builds in general and git
 /// operation especially, as well as respecting concurrency limits.
 pub struct DistributionDatabase<'a, Context: BuildContext> {
     build_context: &'a Context,
     builder: SourceDistributionBuilder<'a, Context>,
-    locks: Rc<Locks>,
     client: ManagedClient<'a>,
     reporter: Option<Arc<dyn Reporter>>,
 }
@@ -61,24 +59,30 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         client: &'a RegistryClient,
         build_context: &'a Context,
         concurrent_downloads: usize,
-        preview_mode: PreviewMode,
     ) -> Self {
         Self {
             build_context,
-            builder: SourceDistributionBuilder::new(build_context, preview_mode),
-            locks: Rc::new(Locks::default()),
+            builder: SourceDistributionBuilder::new(build_context),
             client: ManagedClient::new(client, concurrent_downloads),
             reporter: None,
         }
     }
 
-    /// Set the [`Reporter`] to use for this source distribution fetcher.
+    /// Set the build stack to use for the [`DistributionDatabase`].
     #[must_use]
-    pub fn with_reporter(self, reporter: impl Reporter + 'static) -> Self {
-        let reporter = Arc::new(reporter);
+    pub fn with_build_stack(self, build_stack: &'a BuildStack) -> Self {
         Self {
-            reporter: Some(reporter.clone()),
-            builder: self.builder.with_reporter(reporter),
+            builder: self.builder.with_build_stack(build_stack),
+            ..self
+        }
+    }
+
+    /// Set the [`Reporter`] to use for the [`DistributionDatabase`].
+    #[must_use]
+    pub fn with_reporter(self, reporter: Arc<dyn Reporter>) -> Self {
+        Self {
+            builder: self.builder.with_reporter(reporter.clone()),
+            reporter: Some(reporter),
             ..self
         }
     }
@@ -89,11 +93,12 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "Failed to download distribution due to network timeout. Try increasing UV_HTTP_TIMEOUT (current value: {}s).",  self.client.unmanaged.timeout()
+                    "Failed to download distribution due to network timeout. Try increasing UV_HTTP_TIMEOUT (current value: {}s).",
+                    self.client.unmanaged.timeout().as_secs()
                 ),
             )
         } else {
-            io::Error::new(io::ErrorKind::Other, err)
+            io::Error::other(err)
         }
     }
 
@@ -114,6 +119,32 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             Dist::Built(built) => self.get_wheel(built, hashes).await,
             Dist::Source(source) => self.build_wheel(source, tags, hashes).await,
         }
+    }
+
+    /// Either fetch the only wheel metadata (directly from the index or with range requests) or
+    /// fetch and build the source distribution.
+    ///
+    /// While hashes will be generated in some cases, hash-checking is only enforced for source
+    /// distributions, and should be enforced by the caller for wheels.
+    #[instrument(skip_all, fields(%dist))]
+    pub async fn get_installed_metadata(
+        &self,
+        dist: &InstalledDist,
+    ) -> Result<ArchiveMetadata, Error> {
+        // If the metadata was provided by the user directly, prefer it.
+        if let Some(metadata) = self
+            .build_context
+            .dependency_metadata()
+            .get(dist.name(), Some(dist.version()))
+        {
+            return Ok(ArchiveMetadata::from_metadata23(metadata.clone()));
+        }
+
+        let metadata = dist
+            .read_metadata()
+            .map_err(|err| Error::ReadInstalled(Box::new(dist.clone()), err))?;
+
+        Ok(ArchiveMetadata::from_metadata23(metadata.clone()))
     }
 
     /// Either fetch the only wheel metadata (directly from the index or with range requests) or
@@ -145,39 +176,20 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         dist: &BuiltDist,
         hashes: HashPolicy<'_>,
     ) -> Result<LocalWheel, Error> {
-        if self
-            .build_context
-            .build_options()
-            .no_binary_package(dist.name())
-        {
-            return Err(Error::NoBinary);
-        }
-
         match dist {
             BuiltDist::Registry(wheels) => {
                 let wheel = wheels.best_wheel();
-                let url = match &wheel.file.url {
-                    FileLocation::RelativeUrl(base, url) => {
-                        pypi_types::base_url_join_relative(base, url)?
-                    }
-                    FileLocation::AbsoluteUrl(url) => url.to_url(),
-                    FileLocation::Path(path) => {
-                        let cache_entry = self.build_context.cache().entry(
-                            CacheBucket::Wheels,
-                            WheelCache::Index(&wheel.index).wheel_dir(wheel.name().as_ref()),
-                            wheel.filename.stem(),
-                        );
-                        return self
-                            .load_wheel(path, &wheel.filename, cache_entry, dist, hashes)
-                            .await;
-                    }
-                };
+                let WheelTarget {
+                    url,
+                    extension,
+                    size,
+                } = WheelTarget::try_from(&*wheel.file)?;
 
                 // Create a cache entry for the wheel.
                 let wheel_entry = self.build_context.cache().entry(
                     CacheBucket::Wheels,
                     WheelCache::Index(&wheel.index).wheel_dir(wheel.name().as_ref()),
-                    wheel.filename.stem(),
+                    wheel.filename.cache_key(),
                 );
 
                 // If the URL is a file URL, load the wheel directly.
@@ -186,7 +198,14 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         .to_file_path()
                         .map_err(|()| Error::NonFileUrl(url.clone()))?;
                     return self
-                        .load_wheel(&path, &wheel.filename, wheel_entry, dist, hashes)
+                        .load_wheel(
+                            &path,
+                            &wheel.filename,
+                            WheelExtension::Whl,
+                            wheel_entry,
+                            dist,
+                            hashes,
+                        )
                         .await;
                 }
 
@@ -194,8 +213,10 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 match self
                     .stream_wheel(
                         url.clone(),
+                        dist.index(),
                         &wheel.filename,
-                        wheel.file.size,
+                        extension,
+                        size,
                         &wheel_entry,
                         dist,
                         hashes,
@@ -204,36 +225,17 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 {
                     Ok(archive) => Ok(LocalWheel {
                         dist: Dist::Built(dist.clone()),
-                        archive: self.build_context.cache().archive(&archive.id),
+                        archive: self
+                            .build_context
+                            .cache()
+                            .archive(&archive.id)
+                            .into_boxed_path(),
                         hashes: archive.hashes,
                         filename: wheel.filename.clone(),
+                        cache: CacheInfo::default(),
+                        build: None,
                     }),
-                    Err(Error::Client(err)) if err.is_http_streaming_unsupported() => {
-                        warn!(
-                            "Streaming unsupported for {dist}; downloading wheel to disk ({err})"
-                        );
-
-                        // If the request failed because streaming is unsupported, download the
-                        // wheel directly.
-                        let archive = self
-                            .download_wheel(
-                                url,
-                                &wheel.filename,
-                                wheel.file.size,
-                                &wheel_entry,
-                                dist,
-                                hashes,
-                            )
-                            .await?;
-
-                        Ok(LocalWheel {
-                            dist: Dist::Built(dist.clone()),
-                            archive: self.build_context.cache().archive(&archive.id),
-                            hashes: archive.hashes,
-                            filename: wheel.filename.clone(),
-                        })
-                    }
-                    Err(Error::Extract(err)) => {
+                    Err(Error::Extract(name, err)) => {
                         if err.is_http_streaming_unsupported() {
                             warn!(
                                 "Streaming unsupported for {dist}; downloading wheel to disk ({err})"
@@ -241,7 +243,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         } else if err.is_http_streaming_failed() {
                             warn!("Streaming failed for {dist}; downloading wheel to disk ({err})");
                         } else {
-                            return Err(Error::Extract(err));
+                            return Err(Error::Extract(name, err));
                         }
 
                         // If the request failed because streaming is unsupported, download the
@@ -249,8 +251,10 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         let archive = self
                             .download_wheel(
                                 url,
+                                dist.index(),
                                 &wheel.filename,
-                                wheel.file.size,
+                                extension,
+                                size,
                                 &wheel_entry,
                                 dist,
                                 hashes,
@@ -259,9 +263,15 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
 
                         Ok(LocalWheel {
                             dist: Dist::Built(dist.clone()),
-                            archive: self.build_context.cache().archive(&archive.id),
+                            archive: self
+                                .build_context
+                                .cache()
+                                .archive(&archive.id)
+                                .into_boxed_path(),
                             hashes: archive.hashes,
                             filename: wheel.filename.clone(),
+                            cache: CacheInfo::default(),
+                            build: None,
                         })
                     }
                     Err(err) => Err(err),
@@ -273,14 +283,16 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 let wheel_entry = self.build_context.cache().entry(
                     CacheBucket::Wheels,
                     WheelCache::Url(&wheel.url).wheel_dir(wheel.name().as_ref()),
-                    wheel.filename.stem(),
+                    wheel.filename.cache_key(),
                 );
 
                 // Download and unzip.
                 match self
                     .stream_wheel(
                         wheel.url.raw().clone(),
+                        None,
                         &wheel.filename,
+                        WheelExtension::Whl,
                         None,
                         &wheel_entry,
                         dist,
@@ -290,9 +302,15 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 {
                     Ok(archive) => Ok(LocalWheel {
                         dist: Dist::Built(dist.clone()),
-                        archive: self.build_context.cache().archive(&archive.id),
+                        archive: self
+                            .build_context
+                            .cache()
+                            .archive(&archive.id)
+                            .into_boxed_path(),
                         hashes: archive.hashes,
                         filename: wheel.filename.clone(),
+                        cache: CacheInfo::default(),
+                        build: None,
                     }),
                     Err(Error::Client(err)) if err.is_http_streaming_unsupported() => {
                         warn!(
@@ -304,7 +322,9 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         let archive = self
                             .download_wheel(
                                 wheel.url.raw().clone(),
+                                None,
                                 &wheel.filename,
+                                WheelExtension::Whl,
                                 None,
                                 &wheel_entry,
                                 dist,
@@ -313,39 +333,15 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                             .await?;
                         Ok(LocalWheel {
                             dist: Dist::Built(dist.clone()),
-                            archive: self.build_context.cache().archive(&archive.id),
+                            archive: self
+                                .build_context
+                                .cache()
+                                .archive(&archive.id)
+                                .into_boxed_path(),
                             hashes: archive.hashes,
                             filename: wheel.filename.clone(),
-                        })
-                    }
-                    Err(Error::Extract(err)) => {
-                        if err.is_http_streaming_unsupported() {
-                            warn!(
-                                "Streaming unsupported for {dist}; downloading wheel to disk ({err})"
-                            );
-                        } else if err.is_http_streaming_failed() {
-                            warn!("Streaming failed for {dist}; downloading wheel to disk ({err})");
-                        } else {
-                            return Err(Error::Extract(err));
-                        }
-
-                        // If the request failed because streaming is unsupported, download the
-                        // wheel directly.
-                        let archive = self
-                            .download_wheel(
-                                wheel.url.raw().clone(),
-                                &wheel.filename,
-                                None,
-                                &wheel_entry,
-                                dist,
-                                hashes,
-                            )
-                            .await?;
-                        Ok(LocalWheel {
-                            dist: Dist::Built(dist.clone()),
-                            archive: self.build_context.cache().archive(&archive.id),
-                            hashes: archive.hashes,
-                            filename: wheel.filename.clone(),
+                            cache: CacheInfo::default(),
+                            build: None,
                         })
                     }
                     Err(err) => Err(err),
@@ -356,11 +352,18 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 let cache_entry = self.build_context.cache().entry(
                     CacheBucket::Wheels,
                     WheelCache::Url(&wheel.url).wheel_dir(wheel.name().as_ref()),
-                    wheel.filename.stem(),
+                    wheel.filename.cache_key(),
                 );
 
-                self.load_wheel(&wheel.path, &wheel.filename, cache_entry, dist, hashes)
-                    .await
+                self.load_wheel(
+                    &wheel.install_path,
+                    &wheel.filename,
+                    WheelExtension::Whl,
+                    cache_entry,
+                    dist,
+                    hashes,
+                )
+                .await
             }
         }
     }
@@ -376,24 +379,57 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         tags: &Tags,
         hashes: HashPolicy<'_>,
     ) -> Result<LocalWheel, Error> {
-        let lock = self.locks.acquire(&Dist::Source(dist.clone())).await;
-        let _guard = lock.lock().await;
-
         let built_wheel = self
             .builder
             .download_and_build(&BuildableSource::Dist(dist), tags, hashes, &self.client)
             .boxed_local()
             .await?;
 
+        // Check that the wheel is compatible with its install target.
+        //
+        // When building a build dependency for a cross-install, the build dependency needs
+        // to install and run on the host instead of the target. In this case the `tags` are already
+        // for the host instead of the target, so this check passes.
+        if !built_wheel.filename.is_compatible(tags) {
+            return if tags.is_cross() {
+                Err(Error::BuiltWheelIncompatibleTargetPlatform {
+                    filename: built_wheel.filename,
+                    python_platform: tags.python_platform().clone(),
+                    python_version: tags.python_version(),
+                })
+            } else {
+                Err(Error::BuiltWheelIncompatibleHostPlatform {
+                    filename: built_wheel.filename,
+                    python_platform: tags.python_platform().clone(),
+                    python_version: tags.python_version(),
+                })
+            };
+        }
+
+        // Acquire the advisory lock.
+        #[cfg(windows)]
+        let _lock = {
+            let lock_entry = CacheEntry::new(
+                built_wheel.target.parent().unwrap(),
+                format!(
+                    "{}.lock",
+                    built_wheel.target.file_name().unwrap().to_str().unwrap()
+                ),
+            );
+            lock_entry.lock().await.map_err(Error::CacheLock)?
+        };
+
         // If the wheel was unzipped previously, respect it. Source distributions are
         // cached under a unique revision ID, so unzipped directories are never stale.
-        match built_wheel.target.canonicalize() {
+        match self.build_context.cache().resolve_link(&built_wheel.target) {
             Ok(archive) => {
                 return Ok(LocalWheel {
                     dist: Dist::Source(dist.clone()),
-                    archive,
+                    archive: archive.into_boxed_path(),
                     filename: built_wheel.filename,
                     hashes: built_wheel.hashes,
+                    cache: built_wheel.cache_info,
+                    build: Some(built_wheel.build_info),
                 });
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -407,9 +443,11 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
 
         Ok(LocalWheel {
             dist: Dist::Source(dist.clone()),
-            archive: self.build_context.cache().archive(&id),
+            archive: self.build_context.cache().archive(&id).into_boxed_path(),
             hashes: built_wheel.hashes,
             filename: built_wheel.filename,
+            cache: built_wheel.cache_info,
+            build: Some(built_wheel.build_info),
         })
     }
 
@@ -417,41 +455,74 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
     ///
     /// While hashes will be generated in some cases, hash-checking is _not_ enforced and should
     /// instead be enforced by the caller.
-    pub async fn get_wheel_metadata(
+    async fn get_wheel_metadata(
         &self,
         dist: &BuiltDist,
         hashes: HashPolicy<'_>,
     ) -> Result<ArchiveMetadata, Error> {
-        // If hash generation is enabled, and the distribution isn't hosted on an index, get the
+        // If hash generation is enabled, and the distribution isn't hosted on a registry, get the
         // entire wheel to ensure that the hashes are included in the response. If the distribution
         // is hosted on an index, the hashes will be included in the simple metadata response.
         // For hash _validation_, callers are expected to enforce the policy when retrieving the
         // wheel.
+        //
+        // Historically, for `uv pip compile --universal`, we also generate hashes for
+        // registry-based distributions when the relevant registry doesn't provide them. This was
+        // motivated by `--find-links`. We continue that behavior (under `HashGeneration::All`) for
+        // backwards compatibility, but it's a little dubious, since we're only hashing _one_
+        // distribution here (as opposed to hashing all distributions for the version), and it may
+        // not even be a compatible distribution!
+        //
         // TODO(charlie): Request the hashes via a separate method, to reduce the coupling in this API.
-        if hashes.is_generate() {
-            if dist.file().map_or(true, |file| file.hashes.is_empty()) {
-                let wheel = self.get_wheel(dist, hashes).await?;
-                let metadata = wheel.metadata()?;
-                let hashes = wheel.hashes;
-                return Ok(ArchiveMetadata {
-                    metadata: Metadata::from_metadata23(metadata),
-                    hashes,
-                });
-            }
+        if hashes.is_generate(dist) {
+            let wheel = self.get_wheel(dist, hashes).await?;
+            // If the metadata was provided by the user directly, prefer it.
+            let metadata = if let Some(metadata) = self
+                .build_context
+                .dependency_metadata()
+                .get(dist.name(), Some(dist.version()))
+            {
+                metadata.clone()
+            } else {
+                wheel.metadata()?
+            };
+            let hashes = wheel.hashes;
+            return Ok(ArchiveMetadata {
+                metadata: Metadata::from_metadata23(metadata),
+                hashes,
+            });
+        }
+
+        // If the metadata was provided by the user directly, prefer it.
+        if let Some(metadata) = self
+            .build_context
+            .dependency_metadata()
+            .get(dist.name(), Some(dist.version()))
+        {
+            return Ok(ArchiveMetadata::from_metadata23(metadata.clone()));
         }
 
         let result = self
             .client
-            .managed(|client| client.wheel_metadata(dist).boxed_local())
+            .managed(|client| {
+                client
+                    .wheel_metadata(dist, self.build_context.capabilities())
+                    .boxed_local()
+            })
             .await;
 
         match result {
-            Ok(metadata) => Ok(ArchiveMetadata::from_metadata23(metadata)),
-            Err(err) if err.is_http_range_requests_unsupported() => {
-                warn!("Range requests unsupported when fetching metadata for {dist}; downloading wheel directly ({err})");
+            Ok(metadata) => {
+                // Validate that the metadata is consistent with the distribution.
+                Ok(ArchiveMetadata::from_metadata23(metadata))
+            }
+            Err(err) if err.is_http_streaming_unsupported() => {
+                warn!(
+                    "Streaming unsupported when fetching metadata for {dist}; downloading wheel directly ({err})"
+                );
 
-                // If the request failed due to an error that could be resolved by downloading the
-                // wheel directly, try that.
+                // If the request failed due to an error that could be resolved by
+                // downloading the wheel directly, try that.
                 let wheel = self.get_wheel(dist, hashes).await?;
                 let metadata = wheel.metadata()?;
                 let hashes = wheel.hashes;
@@ -473,21 +544,20 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         source: &BuildableSource<'_>,
         hashes: HashPolicy<'_>,
     ) -> Result<ArchiveMetadata, Error> {
-        // Optimization: Skip source dist download when we must not build them anyway.
-        if self
-            .build_context
-            .build_options()
-            .no_build_requirement(source.name())
-        {
-            if source.is_editable() {
-                debug!("Allowing build for editable source distribution: {source}");
-            } else {
-                return Err(Error::NoBuild);
+        // If the metadata was provided by the user directly, prefer it.
+        if let Some(dist) = source.as_dist() {
+            if let Some(metadata) = self
+                .build_context
+                .dependency_metadata()
+                .get(dist.name(), dist.version())
+            {
+                // If we skipped the build, we should still resolve any Git dependencies to precise
+                // commits.
+                self.builder.resolve_revision(source, &self.client).await?;
+
+                return Ok(ArchiveMetadata::from_metadata23(metadata.clone()));
             }
         }
-
-        let lock = self.locks.acquire(source).await;
-        let _guard = lock.lock().await;
 
         let metadata = self
             .builder
@@ -499,22 +569,41 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
     }
 
     /// Return the [`RequiresDist`] from a `pyproject.toml`, if it can be statically extracted.
-    pub async fn requires_dist(&self, project_root: &Path) -> Result<RequiresDist, Error> {
-        self.builder.requires_dist(project_root).await
+    pub async fn requires_dist(
+        &self,
+        path: &Path,
+        pyproject_toml: &PyProjectToml,
+    ) -> Result<Option<RequiresDist>, Error> {
+        self.builder
+            .source_tree_requires_dist(
+                path,
+                pyproject_toml,
+                self.client.unmanaged.credentials_cache(),
+            )
+            .await
     }
 
     /// Stream a wheel from a URL, unzipping it into the cache as it's downloaded.
     async fn stream_wheel(
         &self,
-        url: Url,
+        url: DisplaySafeUrl,
+        index: Option<&IndexUrl>,
         filename: &WheelFilename,
+        extension: WheelExtension,
         size: Option<u64>,
         wheel_entry: &CacheEntry,
         dist: &BuiltDist,
         hashes: HashPolicy<'_>,
     ) -> Result<Archive, Error> {
+        // Acquire an advisory lock, to guard against concurrent writes.
+        #[cfg(windows)]
+        let _lock = {
+            let lock_entry = wheel_entry.with_file(format!("{}.lock", filename.stem()));
+            lock_entry.lock().await.map_err(Error::CacheLock)?
+        };
+
         // Create an entry for the HTTP cache.
-        let http_entry = wheel_entry.with_file(format!("{}.http", filename.stem()));
+        let http_entry = wheel_entry.with_file(format!("{}.http", filename.cache_key()));
 
         let download = |response: reqwest::Response| {
             async {
@@ -542,11 +631,31 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 match progress {
                     Some((reporter, progress)) => {
                         let mut reader = ProgressReader::new(&mut hasher, progress, &**reporter);
-                        uv_extract::stream::unzip(&mut reader, temp_dir.path()).await?;
+                        match extension {
+                            WheelExtension::Whl => {
+                                uv_extract::stream::unzip(&mut reader, temp_dir.path())
+                                    .await
+                                    .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                            }
+                            WheelExtension::WhlZst => {
+                                uv_extract::stream::untar_zst(&mut reader, temp_dir.path())
+                                    .await
+                                    .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                            }
+                        }
                     }
-                    None => {
-                        uv_extract::stream::unzip(&mut hasher, temp_dir.path()).await?;
-                    }
+                    None => match extension {
+                        WheelExtension::Whl => {
+                            uv_extract::stream::unzip(&mut hasher, temp_dir.path())
+                                .await
+                                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        }
+                        WheelExtension::WhlZst => {
+                            uv_extract::stream::untar_zst(&mut hasher, temp_dir.path())
+                                .await
+                                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        }
+                    },
                 }
 
                 // If necessary, exhaust the reader to compute the hash.
@@ -558,7 +667,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 let id = self
                     .build_context
                     .cache()
-                    .persist(temp_dir.into_path(), wheel_entry.path())
+                    .persist(temp_dir.keep(), wheel_entry.path())
                     .await
                     .map_err(Error::CacheRead)?;
 
@@ -569,6 +678,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 Ok(Archive::new(
                     id,
                     hashers.into_iter().map(HashDigest::from).collect(),
+                    filename.clone(),
                 ))
             }
             .instrument(info_span!("wheel", wheel = %dist))
@@ -577,42 +687,65 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         // Fetch the archive from the cache, or download it if necessary.
         let req = self.request(url.clone())?;
 
+        // Determine the cache control policy for the URL.
         let cache_control = match self.client.unmanaged.connectivity() {
-            Connectivity::Online => CacheControl::from(
-                self.build_context
-                    .cache()
-                    .freshness(&http_entry, Some(&filename.name))
-                    .map_err(Error::CacheRead)?,
-            ),
+            Connectivity::Online => {
+                if let Some(header) = index.and_then(|index| {
+                    self.build_context
+                        .locations()
+                        .artifact_cache_control_for(index)
+                }) {
+                    CacheControl::Override(header)
+                } else {
+                    CacheControl::from(
+                        self.build_context
+                            .cache()
+                            .freshness(&http_entry, Some(&filename.name), None)
+                            .map_err(Error::CacheRead)?,
+                    )
+                }
+            }
             Connectivity::Offline => CacheControl::AllowStale,
         };
 
         let archive = self
             .client
             .managed(|client| {
-                client
-                    .cached_client()
-                    .get_serde(req, &http_entry, cache_control, download)
+                client.cached_client().get_serde_with_retry(
+                    req,
+                    &http_entry,
+                    cache_control,
+                    download,
+                )
             })
             .await
             .map_err(|err| match err {
-                CachedClientError::Callback(err) => err,
-                CachedClientError::Client(err) => Error::Client(err),
+                CachedClientError::Callback { err, .. } => err,
+                CachedClientError::Client { err, .. } => Error::Client(err),
             })?;
 
-        // If the archive is missing the required hashes, force a refresh.
-        let archive = if archive.has_digests(hashes) {
+        // If the archive is missing the required hashes, or has since been removed, force a refresh.
+        let archive = Some(archive)
+            .filter(|archive| archive.has_digests(hashes))
+            .filter(|archive| archive.exists(self.build_context.cache()));
+
+        let archive = if let Some(archive) = archive {
             archive
         } else {
             self.client
-                .managed(|client| async {
+                .managed(async |client| {
                     client
                         .cached_client()
-                        .skip_cache(self.request(url)?, &http_entry, download)
+                        .skip_cache_with_retry(
+                            self.request(url)?,
+                            &http_entry,
+                            cache_control,
+                            download,
+                        )
                         .await
                         .map_err(|err| match err {
-                            CachedClientError::Callback(err) => err,
-                            CachedClientError::Client(err) => Error::Client(err),
+                            CachedClientError::Callback { err, .. } => err,
+                            CachedClientError::Client { err, .. } => Error::Client(err),
                         })
                 })
                 .await?
@@ -624,15 +757,24 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
     /// Download a wheel from a URL, then unzip it into the cache.
     async fn download_wheel(
         &self,
-        url: Url,
+        url: DisplaySafeUrl,
+        index: Option<&IndexUrl>,
         filename: &WheelFilename,
+        extension: WheelExtension,
         size: Option<u64>,
         wheel_entry: &CacheEntry,
         dist: &BuiltDist,
         hashes: HashPolicy<'_>,
     ) -> Result<Archive, Error> {
+        // Acquire an advisory lock, to guard against concurrent writes.
+        #[cfg(windows)]
+        let _lock = {
+            let lock_entry = wheel_entry.with_file(format!("{}.lock", filename.stem()));
+            lock_entry.lock().await.map_err(Error::CacheLock)?
+        };
+
         // Create an entry for the HTTP cache.
-        let http_entry = wheel_entry.with_file(format!("{}.http", filename.stem()));
+        let http_entry = wheel_entry.with_file(format!("{}.http", filename.cache_key()));
 
         let download = |response: reqwest::Response| {
             async {
@@ -651,7 +793,10 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 // Download the wheel to a temporary file.
                 let temp_file = tempfile::tempfile_in(self.build_context.cache().root())
                     .map_err(Error::CacheWrite)?;
-                let mut writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(temp_file));
+                let mut writer = tokio::io::BufWriter::new(fs_err::tokio::File::from_std(
+                    // It's an unnamed file on Linux so that's the best approximation.
+                    fs_err::File::from_parts(temp_file, self.build_context.cache().root()),
+                ));
 
                 match progress {
                     Some((reporter, progress)) => {
@@ -687,19 +832,39 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                         let target = temp_dir.path().to_owned();
                         move || -> Result<(), uv_extract::Error> {
                             // Unzip the wheel into a temporary directory.
-                            uv_extract::unzip(file, &target)?;
+                            match extension {
+                                WheelExtension::Whl => {
+                                    uv_extract::unzip(file, &target)?;
+                                }
+                                WheelExtension::WhlZst => {
+                                    uv_extract::stream::untar_zst_file(file, &target)?;
+                                }
+                            }
                             Ok(())
                         }
                     })
-                    .await??;
+                    .await?
+                    .map_err(|err| Error::Extract(filename.to_string(), err))?;
 
-                    vec![]
+                    HashDigests::empty()
                 } else {
                     // Create a hasher for each hash algorithm.
                     let algorithms = hashes.algorithms();
                     let mut hashers = algorithms.into_iter().map(Hasher::from).collect::<Vec<_>>();
                     let mut hasher = uv_extract::hash::HashReader::new(file, &mut hashers);
-                    uv_extract::stream::unzip(&mut hasher, temp_dir.path()).await?;
+
+                    match extension {
+                        WheelExtension::Whl => {
+                            uv_extract::stream::unzip(&mut hasher, temp_dir.path())
+                                .await
+                                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        }
+                        WheelExtension::WhlZst => {
+                            uv_extract::stream::untar_zst(&mut hasher, temp_dir.path())
+                                .await
+                                .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                        }
+                    }
 
                     // If necessary, exhaust the reader to compute the hash.
                     hasher.finish().await.map_err(Error::HashExhaustion)?;
@@ -711,7 +876,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 let id = self
                     .build_context
                     .cache()
-                    .persist(temp_dir.into_path(), wheel_entry.path())
+                    .persist(temp_dir.keep(), wheel_entry.path())
                     .await
                     .map_err(Error::CacheRead)?;
 
@@ -719,7 +884,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                     reporter.on_download_complete(dist.name(), progress);
                 }
 
-                Ok(Archive::new(id, hashes))
+                Ok(Archive::new(id, hashes, filename.clone()))
             }
             .instrument(info_span!("wheel", wheel = %dist))
         };
@@ -727,42 +892,65 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         // Fetch the archive from the cache, or download it if necessary.
         let req = self.request(url.clone())?;
 
+        // Determine the cache control policy for the URL.
         let cache_control = match self.client.unmanaged.connectivity() {
-            Connectivity::Online => CacheControl::from(
-                self.build_context
-                    .cache()
-                    .freshness(&http_entry, Some(&filename.name))
-                    .map_err(Error::CacheRead)?,
-            ),
+            Connectivity::Online => {
+                if let Some(header) = index.and_then(|index| {
+                    self.build_context
+                        .locations()
+                        .artifact_cache_control_for(index)
+                }) {
+                    CacheControl::Override(header)
+                } else {
+                    CacheControl::from(
+                        self.build_context
+                            .cache()
+                            .freshness(&http_entry, Some(&filename.name), None)
+                            .map_err(Error::CacheRead)?,
+                    )
+                }
+            }
             Connectivity::Offline => CacheControl::AllowStale,
         };
 
         let archive = self
             .client
             .managed(|client| {
-                client
-                    .cached_client()
-                    .get_serde(req, &http_entry, cache_control, download)
+                client.cached_client().get_serde_with_retry(
+                    req,
+                    &http_entry,
+                    cache_control,
+                    download,
+                )
             })
             .await
             .map_err(|err| match err {
-                CachedClientError::Callback(err) => err,
-                CachedClientError::Client(err) => Error::Client(err),
+                CachedClientError::Callback { err, .. } => err,
+                CachedClientError::Client { err, .. } => Error::Client(err),
             })?;
 
-        // If the archive is missing the required hashes, force a refresh.
-        let archive = if archive.has_digests(hashes) {
+        // If the archive is missing the required hashes, or has since been removed, force a refresh.
+        let archive = Some(archive)
+            .filter(|archive| archive.has_digests(hashes))
+            .filter(|archive| archive.exists(self.build_context.cache()));
+
+        let archive = if let Some(archive) = archive {
             archive
         } else {
             self.client
-                .managed(|client| async move {
+                .managed(async |client| {
                     client
                         .cached_client()
-                        .skip_cache(self.request(url)?, &http_entry, download)
+                        .skip_cache_with_retry(
+                            self.request(url)?,
+                            &http_entry,
+                            cache_control,
+                            download,
+                        )
                         .await
                         .map_err(|err| match err {
-                            CachedClientError::Callback(err) => err,
-                            CachedClientError::Client(err) => Error::Client(err),
+                            CachedClientError::Callback { err, .. } => err,
+                            CachedClientError::Client { err, .. } => Error::Client(err),
                         })
                 })
                 .await?
@@ -776,15 +964,22 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         &self,
         path: &Path,
         filename: &WheelFilename,
+        extension: WheelExtension,
         wheel_entry: CacheEntry,
         dist: &BuiltDist,
         hashes: HashPolicy<'_>,
     ) -> Result<LocalWheel, Error> {
+        #[cfg(windows)]
+        let _lock = {
+            let lock_entry = wheel_entry.with_file(format!("{}.lock", filename.stem()));
+            lock_entry.lock().await.map_err(Error::CacheLock)?
+        };
+
         // Determine the last-modified time of the wheel.
-        let modified = ArchiveTimestamp::from_file(path).map_err(Error::CacheRead)?;
+        let modified = Timestamp::from_path(path).map_err(Error::CacheRead)?;
 
         // Attempt to read the archive pointer from the cache.
-        let pointer_entry = wheel_entry.with_file(format!("{}.rev", filename.stem()));
+        let pointer_entry = wheel_entry.with_file(format!("{}.rev", filename.cache_key()));
         let pointer = LocalArchivePointer::read_from(&pointer_entry)?;
 
         // Extract the archive from the pointer.
@@ -797,26 +992,42 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         if let Some(archive) = archive {
             Ok(LocalWheel {
                 dist: Dist::Built(dist.clone()),
-                archive: self.build_context.cache().archive(&archive.id),
+                archive: self
+                    .build_context
+                    .cache()
+                    .archive(&archive.id)
+                    .into_boxed_path(),
                 hashes: archive.hashes,
                 filename: filename.clone(),
+                cache: CacheInfo::from_timestamp(modified),
+                build: None,
             })
         } else if hashes.is_none() {
             // Otherwise, unzip the wheel.
-            let archive = Archive::new(self.unzip_wheel(path, wheel_entry.path()).await?, vec![]);
+            let archive = Archive::new(
+                self.unzip_wheel(path, wheel_entry.path()).await?,
+                HashDigests::empty(),
+                filename.clone(),
+            );
 
             // Write the archive pointer to the cache.
             let pointer = LocalArchivePointer {
-                timestamp: modified.timestamp(),
+                timestamp: modified,
                 archive: archive.clone(),
             };
             pointer.write_to(&pointer_entry).await?;
 
             Ok(LocalWheel {
                 dist: Dist::Built(dist.clone()),
-                archive: self.build_context.cache().archive(&archive.id),
+                archive: self
+                    .build_context
+                    .cache()
+                    .archive(&archive.id)
+                    .into_boxed_path(),
                 hashes: archive.hashes,
                 filename: filename.clone(),
+                cache: CacheInfo::from_timestamp(modified),
+                build: None,
             })
         } else {
             // If necessary, compute the hashes of the wheel.
@@ -832,7 +1043,18 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             let mut hasher = uv_extract::hash::HashReader::new(file, &mut hashers);
 
             // Unzip the wheel to a temporary directory.
-            uv_extract::stream::unzip(&mut hasher, temp_dir.path()).await?;
+            match extension {
+                WheelExtension::Whl => {
+                    uv_extract::stream::unzip(&mut hasher, temp_dir.path())
+                        .await
+                        .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                }
+                WheelExtension::WhlZst => {
+                    uv_extract::stream::untar_zst(&mut hasher, temp_dir.path())
+                        .await
+                        .map_err(|err| Error::Extract(filename.to_string(), err))?;
+                }
+            }
 
             // Exhaust the reader to compute the hash.
             hasher.finish().await.map_err(Error::HashExhaustion)?;
@@ -843,25 +1065,31 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             let id = self
                 .build_context
                 .cache()
-                .persist(temp_dir.into_path(), wheel_entry.path())
+                .persist(temp_dir.keep(), wheel_entry.path())
                 .await
                 .map_err(Error::CacheWrite)?;
 
             // Create an archive.
-            let archive = Archive::new(id, hashes);
+            let archive = Archive::new(id, hashes, filename.clone());
 
             // Write the archive pointer to the cache.
             let pointer = LocalArchivePointer {
-                timestamp: modified.timestamp(),
+                timestamp: modified,
                 archive: archive.clone(),
             };
             pointer.write_to(&pointer_entry).await?;
 
             Ok(LocalWheel {
                 dist: Dist::Built(dist.clone()),
-                archive: self.build_context.cache().archive(&archive.id),
+                archive: self
+                    .build_context
+                    .cache()
+                    .archive(&archive.id)
+                    .into_boxed_path(),
                 hashes: archive.hashes,
                 filename: filename.clone(),
+                cache: CacheInfo::from_timestamp(modified),
+                build: None,
             })
         }
     }
@@ -871,10 +1099,12 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         let temp_dir = tokio::task::spawn_blocking({
             let path = path.to_owned();
             let root = self.build_context.cache().root().to_path_buf();
-            move || -> Result<TempDir, uv_extract::Error> {
+            move || -> Result<TempDir, Error> {
                 // Unzip the wheel into a temporary directory.
-                let temp_dir = tempfile::tempdir_in(root)?;
-                uv_extract::unzip(fs_err::File::open(path)?, temp_dir.path())?;
+                let temp_dir = tempfile::tempdir_in(root).map_err(Error::CacheWrite)?;
+                let reader = fs_err::File::open(&path).map_err(Error::CacheWrite)?;
+                uv_extract::unzip(reader, temp_dir.path())
+                    .map_err(|err| Error::Extract(path.to_string_lossy().into_owned(), err))?;
                 Ok(temp_dir)
             }
         })
@@ -884,7 +1114,7 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         let id = self
             .build_context
             .cache()
-            .persist(temp_dir.into_path(), target)
+            .persist(temp_dir.keep(), target)
             .await
             .map_err(Error::CacheWrite)?;
 
@@ -892,11 +1122,11 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
     }
 
     /// Returns a GET [`reqwest::Request`] for the given URL.
-    fn request(&self, url: Url) -> Result<reqwest::Request, reqwest::Error> {
+    fn request(&self, url: DisplaySafeUrl) -> Result<reqwest::Request, reqwest::Error> {
         self.client
             .unmanaged
-            .uncached_client()
-            .get(url)
+            .uncached_client(&url)
+            .get(Url::from(url))
             .header(
                 // `reqwest` defaults to accepting compressed responses.
                 // Specify identity encoding to get consistent .whl downloading
@@ -905,11 +1135,6 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
                 reqwest::header::HeaderValue::from_static("identity"),
             )
             .build()
-    }
-
-    /// Return the [`IndexLocations`] used by this resolver.
-    pub fn index_locations(&self) -> &IndexLocations {
-        self.build_context.index_locations()
     }
 
     /// Return the [`ManagedClient`] used by this resolver.
@@ -926,7 +1151,7 @@ pub struct ManagedClient<'a> {
 
 impl<'a> ManagedClient<'a> {
     /// Create a new `ManagedClient` using the given client and concurrency limit.
-    fn new(client: &'a RegistryClient, concurrency: usize) -> ManagedClient<'a> {
+    fn new(client: &'a RegistryClient, concurrency: usize) -> Self {
         ManagedClient {
             unmanaged: client,
             control: Semaphore::new(concurrency),
@@ -943,6 +1168,20 @@ impl<'a> ManagedClient<'a> {
     {
         let _permit = self.control.acquire().await.unwrap();
         f(self.unmanaged).await
+    }
+
+    /// Perform a request using a client that internally manages the concurrency limit.
+    ///
+    /// The callback is passed the client and a semaphore. It must acquire the semaphore before
+    /// any request through the client and drop it after.
+    ///
+    /// This method serves as an escape hatch for functions that may want to send multiple requests
+    /// in parallel.
+    pub async fn manual<F, T>(&'a self, f: impl FnOnce(&'a RegistryClient, &'a Semaphore) -> F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        f(self.unmanaged, &self.control).await
     }
 }
 
@@ -1017,6 +1256,16 @@ impl HttpArchivePointer {
     pub fn into_archive(self) -> Archive {
         self.archive
     }
+
+    /// Return the [`CacheInfo`] from the pointer.
+    pub fn to_cache_info(&self) -> CacheInfo {
+        CacheInfo::default()
+    }
+
+    /// Return the [`BuildInfo`] from the pointer.
+    pub fn to_build_info(&self) -> Option<BuildInfo> {
+        None
+    }
 }
 
 /// A pointer to an archive in the cache, fetched from a local path.
@@ -1032,7 +1281,7 @@ impl LocalArchivePointer {
     /// Read an [`LocalArchivePointer`] from the cache.
     pub fn read_from(path: impl AsRef<Path>) -> Result<Option<Self>, Error> {
         match fs_err::read(path) {
-            Ok(cached) => Ok(Some(rmp_serde::from_slice::<LocalArchivePointer>(&cached)?)),
+            Ok(cached) => Ok(Some(rmp_serde::from_slice::<Self>(&cached)?)),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(Error::CacheRead(err)),
         }
@@ -1046,12 +1295,109 @@ impl LocalArchivePointer {
     }
 
     /// Returns `true` if the archive is up-to-date with the given modified timestamp.
-    pub fn is_up_to_date(&self, modified: ArchiveTimestamp) -> bool {
-        self.timestamp == modified.timestamp()
+    pub fn is_up_to_date(&self, modified: Timestamp) -> bool {
+        self.timestamp == modified
     }
 
     /// Return the [`Archive`] from the pointer.
     pub fn into_archive(self) -> Archive {
         self.archive
+    }
+
+    /// Return the [`CacheInfo`] from the pointer.
+    pub fn to_cache_info(&self) -> CacheInfo {
+        CacheInfo::from_timestamp(self.timestamp)
+    }
+
+    /// Return the [`BuildInfo`] from the pointer.
+    pub fn to_build_info(&self) -> Option<BuildInfo> {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WheelTarget {
+    /// The URL from which the wheel can be downloaded.
+    url: DisplaySafeUrl,
+    /// The expected extension of the wheel file.
+    extension: WheelExtension,
+    /// The expected size of the wheel file, if known.
+    size: Option<u64>,
+}
+
+impl TryFrom<&File> for WheelTarget {
+    type Error = ToUrlError;
+
+    /// Determine the [`WheelTarget`] from a [`File`].
+    fn try_from(file: &File) -> Result<Self, Self::Error> {
+        let url = file.url.to_url()?;
+        if let Some(zstd) = file.zstd.as_ref() {
+            Ok(Self {
+                url: add_tar_zst_extension(url),
+                extension: WheelExtension::WhlZst,
+                size: zstd.size,
+            })
+        } else {
+            Ok(Self {
+                url,
+                extension: WheelExtension::Whl,
+                size: file.size,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum WheelExtension {
+    /// A `.whl` file.
+    Whl,
+    /// A `.whl.tar.zst` file.
+    WhlZst,
+}
+
+/// Add `.tar.zst` to the end of the URL path, if it doesn't already exist.
+#[must_use]
+fn add_tar_zst_extension(mut url: DisplaySafeUrl) -> DisplaySafeUrl {
+    let mut path = url.path().to_string();
+
+    if !path.ends_with(".tar.zst") {
+        path.push_str(".tar.zst");
+    }
+
+    url.set_path(&path);
+    url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_tar_zst_extension() {
+        let url =
+            DisplaySafeUrl::parse("https://files.pythonhosted.org/flask-3.1.0-py3-none-any.whl")
+                .unwrap();
+        assert_eq!(
+            add_tar_zst_extension(url).as_str(),
+            "https://files.pythonhosted.org/flask-3.1.0-py3-none-any.whl.tar.zst"
+        );
+
+        let url = DisplaySafeUrl::parse(
+            "https://files.pythonhosted.org/flask-3.1.0-py3-none-any.whl.tar.zst",
+        )
+        .unwrap();
+        assert_eq!(
+            add_tar_zst_extension(url).as_str(),
+            "https://files.pythonhosted.org/flask-3.1.0-py3-none-any.whl.tar.zst"
+        );
+
+        let url = DisplaySafeUrl::parse(
+            "https://files.pythonhosted.org/flask-3.1.0%2Bcu124-py3-none-any.whl",
+        )
+        .unwrap();
+        assert_eq!(
+            add_tar_zst_extension(url).as_str(),
+            "https://files.pythonhosted.org/flask-3.1.0%2Bcu124-py3-none-any.whl.tar.zst"
+        );
     }
 }

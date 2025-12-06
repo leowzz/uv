@@ -14,8 +14,8 @@ define dependencies.
 
 To lock dependencies declared in a `pyproject.toml`:
 
-```bash
-uv pip compile pyproject.toml -o requirements.txt
+```console
+$ uv pip compile pyproject.toml -o requirements.txt
 ```
 
 Note by default the `uv pip compile` output is just displayed and `--output-file` / `-o` argument is
@@ -23,42 +23,71 @@ needed to write to a file.
 
 To lock dependencies declared in a `requirements.in`:
 
-```bash
-uv pip compile requirements.in -o requirements.txt
+```console
+$ uv pip compile requirements.in -o requirements.txt
 ```
 
 To lock dependencies declared in multiple files:
 
-```bash
-uv pip compile pyproject.toml requirements-dev.in -o requirements-dev.txt`
+```console
+$ uv pip compile pyproject.toml requirements-dev.in -o requirements-dev.txt
 ```
 
 uv also supports legacy `setup.py` and `setup.cfg` formats. To lock dependencies declared in a
 `setup.py`:
 
-```bash
-uv pip compile setup.py -o requirements.txt
+```console
+$ uv pip compile setup.py -o requirements.txt
 ```
 
 To lock dependencies from stdin, use `-`:
 
-```bash
-echo "ruff" | uv pip compile -
+```console
+$ echo "ruff" | uv pip compile -
 ```
 
 To lock with optional dependencies enabled, e.g., the "foo" extra:
 
-```bash
-uv pip install -r pyproject.toml --extra foo
+```console
+$ uv pip compile pyproject.toml --extra foo
 ```
 
 To lock with all optional dependencies enabled:
 
-```bash
-uv pip install -r pyproject.toml --all-extras
+```console
+$ uv pip compile pyproject.toml --all-extras
 ```
 
 Note extras are not supported with the `requirements.in` format.
+
+To lock a dependency group in the current project directory's `pyproject.toml`, for example the
+group `foo`:
+
+```console
+$ uv pip compile --group foo
+```
+
+!!! important
+
+    A `--group` flag has to be added to pip-tools' `pip compile`, [although they're considering it](https://github.com/jazzband/pip-tools/issues/2062). We expect to support whatever syntax and semantics they adopt.
+
+To specify the project directory where groups should be sourced from:
+
+```console
+$ uv pip compile --project some/path/ --group foo --group bar
+```
+
+Alternatively, you can specify a path to a `pyproject.toml` for each group:
+
+```console
+$ uv pip compile --group some/path/pyproject.toml:foo --group other/pyproject.toml:bar
+```
+
+!!! note
+
+    `--group` flags do not apply to other specified sources. For instance,
+    `uv pip compile some/path/pyproject.toml --group foo` sources `foo`
+    from `./pyproject.toml` and **not** `some/path/pyproject.toml`.
 
 ## Upgrading requirements
 
@@ -75,8 +104,8 @@ ruff==0.3.0
 
 To upgrade a dependency, use the `--upgrade-package` flag:
 
-```bash
-uv pip compile - -o requirements.txt --upgrade-package ruff
+```console
+$ uv pip compile - -o requirements.txt --upgrade-package ruff
 ```
 
 To upgrade all dependencies, there is an `--upgrade` flag.
@@ -94,14 +123,14 @@ exactly matches the lockfile, use `uv pip sync` instead.
 
 To sync an environment with a `requirements.txt` file:
 
-```bash
-uv pip sync requirements.txt
+```console
+$ uv pip sync requirements.txt
 ```
 
-To sync an environment with a `pyproject.toml` file:
+To sync an environment with a [PEP 751](https://peps.python.org/pep-0751/) `pylock.toml` file:
 
-```bash
-uv pip sync pyproject.toml
+```console
+$ uv pip sync pylock.toml
 ```
 
 ## Adding constraints
@@ -113,17 +142,49 @@ dependencies of the current project.
 
 To define a constraint, define a bound for a package:
 
-```text title="constraints.txt"
+```python title="constraints.txt"
 pydantic<2.0
 ```
 
 To use a constraints file:
 
-```bash
-uv pip compile requirements.in --constraint constraints.txt
+```console
+$ uv pip compile requirements.in --constraint constraints.txt
 ```
 
 Note that multiple constraints can be defined in each file and multiple files can be used.
+
+uv will also read `constraint-dependencies` from the `pyproject.toml` at the workspace root, and
+append them to those specified in the constraints file.
+
+## Adding build constraints
+
+Similar to `constraints`, but specifically for build-time dependencies, including those required
+when building runtime dependencies.
+
+Build constraint files are `requirements.txt`-like files that only control the _version_ of a
+build-time requirement. However, including a package in a build constraints file will _not_ trigger
+its installation at build time; instead, constraints apply only when the package is required as a
+direct or transitive build-time dependency. Build constraints can be used to add bounds to
+dependencies that are not explicitly declared as build-time dependencies of the current project.
+
+For example, if a package defines its build dependencies as follows:
+
+```toml title="pyproject.toml"
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+```
+
+Build constraints could be used to ensure that a specific version of `setuptools` is used for every
+package in the workspace:
+
+```python title="build-constraints.txt"
+setuptools==75.0.0
+```
+
+uv will also read `build-constraint-dependencies` from the `pyproject.toml` at the workspace root,
+and append them to those specified in the build constraints file.
 
 ## Overriding dependency versions
 
@@ -135,20 +196,20 @@ While constraints are _additive_, in that they're combined with the requirements
 packages, overrides are _absolute_, in that they completely replace the requirements of the
 constituent packages.
 
-Overrides are most often used to remove upper bounds from a transtive dependency. For example, if
+Overrides are most often used to remove upper bounds from a transitive dependency. For example, if
 `a` requires `c>=1.0,<2.0` and `b` requires `c>=2.0` and the current project requires `a` and `b`
 then the dependencies cannot be resolved.
 
 To define an override, define the new requirement for the problematic package:
 
-```text title="overrides.txt"
+```python title="overrides.txt"
 c>=2.0
 ```
 
 To use an overrides file:
 
-```bash
-uv pip compile requirements.in --override overrides.txt
+```console
+$ uv pip compile requirements.in --override overrides.txt
 ```
 
 Now, resolution can succeed. However, note that if `a` is _correct_ that it does not support

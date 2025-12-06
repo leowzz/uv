@@ -1,24 +1,42 @@
+use std::borrow::Cow;
+use std::fmt;
+use std::io::Read;
+use std::io::Write;
+use std::str::FromStr;
+
 use base64::prelude::BASE64_STANDARD;
 use base64::read::DecoderReader;
 use base64::write::EncoderWriter;
-
+use http::Uri;
 use netrc::Netrc;
-use reqwest::header::HeaderValue;
+use reqsign::aws::DefaultSigner;
 use reqwest::Request;
-use std::io::Read;
-use std::io::Write;
+use reqwest::header::HeaderValue;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Credentials {
-    /// The name of the user for authentication.
-    username: Username,
-    /// The password to use for authentication.
-    password: Option<String>,
+use uv_redacted::DisplaySafeUrl;
+use uv_static::EnvVars;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Credentials {
+    /// RFC 7617 HTTP Basic Authentication
+    Basic {
+        /// The username to use for authentication.
+        username: Username,
+        /// The password to use for authentication.
+        password: Option<Password>,
+    },
+    /// RFC 6750 Bearer Token Authentication
+    Bearer {
+        /// The token to use for authentication.
+        token: Token,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub(crate) struct Username(Option<String>);
+#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Username(Option<String>);
 
 impl Username {
     /// Create a new username.
@@ -26,15 +44,7 @@ impl Username {
     /// Unlike `reqwest`, empty usernames are be encoded as `None` instead of an empty string.
     pub(crate) fn new(value: Option<String>) -> Self {
         // Ensure empty strings are `None`
-        if let Some(value) = value {
-            if value.is_empty() {
-                Self(None)
-            } else {
-                Self(Some(value))
-            }
-        } else {
-            Self(value)
-        }
+        Self(value.filter(|s| !s.is_empty()))
     }
 
     pub(crate) fn none() -> Self {
@@ -66,34 +76,133 @@ impl From<Option<String>> for Username {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Password(String);
+
+impl Password {
+    pub fn new(password: String) -> Self {
+        Self(password)
+    }
+
+    /// Return the [`Password`] as a string slice.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Convert the [`Password`] into its underlying [`String`].
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Debug for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "****")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Default, Deserialize)]
+#[serde(transparent)]
+pub struct Token(Vec<u8>);
+
+impl Token {
+    pub fn new(token: Vec<u8>) -> Self {
+        Self(token)
+    }
+
+    /// Return the [`Token`] as a byte slice.
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    /// Convert the [`Token`] into its underlying [`Vec<u8>`].
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Return whether the [`Token`] is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "****")
+    }
+}
 impl Credentials {
-    pub(crate) fn new(username: Option<String>, password: Option<String>) -> Self {
-        Self {
+    /// Create a set of HTTP Basic Authentication credentials.
+    #[allow(dead_code)]
+    pub fn basic(username: Option<String>, password: Option<String>) -> Self {
+        Self::Basic {
             username: Username::new(username),
-            password,
+            password: password.map(Password),
         }
     }
 
-    pub(crate) fn username(&self) -> Option<&str> {
-        self.username.as_deref()
+    /// Create a set of Bearer Authentication credentials.
+    #[allow(dead_code)]
+    pub fn bearer(token: Vec<u8>) -> Self {
+        Self::Bearer {
+            token: Token::new(token),
+        }
+    }
+
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            Self::Basic { username, .. } => username.as_deref(),
+            Self::Bearer { .. } => None,
+        }
     }
 
     pub(crate) fn to_username(&self) -> Username {
-        self.username.clone()
+        match self {
+            Self::Basic { username, .. } => username.clone(),
+            Self::Bearer { .. } => Username::none(),
+        }
     }
 
-    pub(crate) fn password(&self) -> Option<&str> {
-        self.password.as_deref()
+    pub(crate) fn as_username(&self) -> Cow<'_, Username> {
+        match self {
+            Self::Basic { username, .. } => Cow::Borrowed(username),
+            Self::Bearer { .. } => Cow::Owned(Username::none()),
+        }
+    }
+
+    pub fn password(&self) -> Option<&str> {
+        match self {
+            Self::Basic { password, .. } => password.as_ref().map(Password::as_str),
+            Self::Bearer { .. } => None,
+        }
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        match self {
+            Self::Basic {
+                username: _,
+                password,
+            } => password.is_some(),
+            Self::Bearer { token } => !token.is_empty(),
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.password.is_none() && self.username.is_none()
+        match self {
+            Self::Basic { username, password } => username.is_none() && password.is_none(),
+            Self::Bearer { token } => token.is_empty(),
+        }
     }
 
     /// Return [`Credentials`] for a [`Url`] from a [`Netrc`] file, if any.
     ///
     /// If a username is provided, it must match the login in the netrc file or [`None`] is returned.
-    pub(crate) fn from_netrc(netrc: &Netrc, url: &Url, username: Option<&str>) -> Option<Self> {
+    pub(crate) fn from_netrc(
+        netrc: &Netrc,
+        url: &DisplaySafeUrl,
+        username: Option<&str>,
+    ) -> Option<Self> {
         let host = url.host_str()?;
         let entry = netrc
             .hosts
@@ -103,40 +212,58 @@ impl Credentials {
         // Ensure the username matches if provided
         if username.is_some_and(|username| username != entry.login) {
             return None;
-        };
+        }
 
-        Some(Credentials {
+        Some(Self::Basic {
             username: Username::new(Some(entry.login.clone())),
-            password: Some(entry.password.clone()),
+            password: Some(Password(entry.password.clone())),
         })
     }
 
     /// Parse [`Credentials`] from a URL, if any.
     ///
     /// Returns [`None`] if both [`Url::username`] and [`Url::password`] are not populated.
-    pub(crate) fn from_url(url: &Url) -> Option<Self> {
+    pub fn from_url(url: &Url) -> Option<Self> {
         if url.username().is_empty() && url.password().is_none() {
             return None;
         }
-        Some(Self {
+        Some(Self::Basic {
             // Remove percent-encoding from URL credentials
             // See <https://github.com/pypa/pip/blob/06d21db4ff1ab69665c22a88718a4ea9757ca293/src/pip/_internal/utils/misc.py#L497-L499>
             username: if url.username().is_empty() {
                 None
             } else {
                 Some(
-                    urlencoding::decode(url.username())
+                    percent_encoding::percent_decode_str(url.username())
+                        .decode_utf8()
                         .expect("An encoded username should always decode")
                         .into_owned(),
                 )
             }
             .into(),
             password: url.password().map(|password| {
-                urlencoding::decode(password)
-                    .expect("An encoded password should always decode")
-                    .into_owned()
+                Password(
+                    percent_encoding::percent_decode_str(password)
+                        .decode_utf8()
+                        .expect("An encoded password should always decode")
+                        .into_owned(),
+                )
             }),
         })
+    }
+
+    /// Extract the [`Credentials`] from the environment, given a named source.
+    ///
+    /// For example, given a name of `"pytorch"`, search for `UV_INDEX_PYTORCH_USERNAME` and
+    /// `UV_INDEX_PYTORCH_PASSWORD`.
+    pub fn from_env(name: impl AsRef<str>) -> Option<Self> {
+        let username = std::env::var(EnvVars::index_username(name.as_ref())).ok();
+        let password = std::env::var(EnvVars::index_password(name.as_ref())).ok();
+        if username.is_none() && password.is_none() {
+            None
+        } else {
+            Some(Self::basic(username, password))
+        }
     }
 
     /// Parse [`Credentials`] from an HTTP request, if any.
@@ -155,59 +282,99 @@ impl Credentials {
 
     /// Parse [`Credentials`] from an authorization header, if any.
     ///
-    /// Only HTTP Basic Authentication is supported.
-    /// [`None`] will be returned if another authoriziation scheme is detected.
+    /// HTTP Basic and Bearer Authentication are both supported.
+    /// [`None`] will be returned if another authorization scheme is detected.
     ///
     /// Panics if the authentication is not conformant to the HTTP Basic Authentication scheme:
     /// - The contents must be base64 encoded
     /// - There must be a `:` separator
     pub(crate) fn from_header_value(header: &HeaderValue) -> Option<Self> {
-        let mut value = header.as_bytes().strip_prefix(b"Basic ")?;
-        let mut decoder = DecoderReader::new(&mut value, &BASE64_STANDARD);
-        let mut buf = String::new();
-        decoder
-            .read_to_string(&mut buf)
-            .expect("HTTP Basic Authentication should be base64 encoded");
-        let (username, password) = buf
-            .split_once(':')
-            .expect("HTTP Basic Authentication should include a `:` separator");
-        let username = if username.is_empty() {
-            None
-        } else {
-            Some(username.to_string())
-        };
-        let password = if password.is_empty() {
-            None
-        } else {
-            Some(password.to_string())
-        };
-        Some(Self::new(username, password))
+        // Parse a `Basic` authentication header.
+        if let Some(mut value) = header.as_bytes().strip_prefix(b"Basic ") {
+            let mut decoder = DecoderReader::new(&mut value, &BASE64_STANDARD);
+            let mut buf = String::new();
+            decoder
+                .read_to_string(&mut buf)
+                .expect("HTTP Basic Authentication should be base64 encoded");
+            let (username, password) = buf
+                .split_once(':')
+                .expect("HTTP Basic Authentication should include a `:` separator");
+            let username = if username.is_empty() {
+                None
+            } else {
+                Some(username.to_string())
+            };
+            let password = if password.is_empty() {
+                None
+            } else {
+                Some(password.to_string())
+            };
+            return Some(Self::Basic {
+                username: Username::new(username),
+                password: password.map(Password),
+            });
+        }
+
+        // Parse a `Bearer` authentication header.
+        if let Some(token) = header.as_bytes().strip_prefix(b"Bearer ") {
+            return Some(Self::Bearer {
+                token: Token::new(token.to_vec()),
+            });
+        }
+
+        None
     }
 
     /// Create an HTTP Basic Authentication header for the credentials.
     ///
     /// Panics if the username or password cannot be base64 encoded.
-    pub(crate) fn to_header_value(&self) -> HeaderValue {
-        // See: <https://github.com/seanmonstar/reqwest/blob/2c11ef000b151c2eebeed2c18a7b81042220c6b0/src/util.rs#L3>
-        let mut buf = b"Basic ".to_vec();
-        {
-            let mut encoder = EncoderWriter::new(&mut buf, &BASE64_STANDARD);
-            write!(encoder, "{}:", self.username().unwrap_or_default())
-                .expect("Write to base64 encoder should succeed");
-            if let Some(password) = self.password() {
-                write!(encoder, "{password}").expect("Write to base64 encoder should succeed");
+    pub fn to_header_value(&self) -> HeaderValue {
+        match self {
+            Self::Basic { .. } => {
+                // See: <https://github.com/seanmonstar/reqwest/blob/2c11ef000b151c2eebeed2c18a7b81042220c6b0/src/util.rs#L3>
+                let mut buf = b"Basic ".to_vec();
+                {
+                    let mut encoder = EncoderWriter::new(&mut buf, &BASE64_STANDARD);
+                    write!(encoder, "{}:", self.username().unwrap_or_default())
+                        .expect("Write to base64 encoder should succeed");
+                    if let Some(password) = self.password() {
+                        write!(encoder, "{password}")
+                            .expect("Write to base64 encoder should succeed");
+                    }
+                }
+                let mut header =
+                    HeaderValue::from_bytes(&buf).expect("base64 is always valid HeaderValue");
+                header.set_sensitive(true);
+                header
+            }
+            Self::Bearer { token } => {
+                let mut header = HeaderValue::from_bytes(&[b"Bearer ", token.as_slice()].concat())
+                    .expect("Bearer token is always valid HeaderValue");
+                header.set_sensitive(true);
+                header
             }
         }
-        let mut header = HeaderValue::from_bytes(&buf).expect("base64 is always valid HeaderValue");
-        header.set_sensitive(true);
-        header
+    }
+
+    /// Apply the credentials to the given URL.
+    ///
+    /// Any existing credentials will be overridden.
+    #[must_use]
+    pub fn apply(&self, mut url: DisplaySafeUrl) -> DisplaySafeUrl {
+        if let Some(username) = self.username() {
+            let _ = url.set_username(username);
+        }
+        if let Some(password) = self.password() {
+            let _ = url.set_password(Some(password));
+        }
+        url
     }
 
     /// Attach the credentials to the given request.
     ///
     /// Any existing credentials will be overridden.
     #[must_use]
-    pub(crate) fn authenticate(&self, mut request: reqwest::Request) -> reqwest::Request {
+    pub fn authenticate(&self, mut request: Request) -> Request {
         request
             .headers_mut()
             .insert(reqwest::header::AUTHORIZATION, Self::to_header_value(self));
@@ -215,8 +382,129 @@ impl Credentials {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum Authentication {
+    /// HTTP Basic or Bearer Authentication credentials.
+    Credentials(Credentials),
+
+    /// AWS Signature Version 4 signing.
+    Signer(DefaultSigner),
+}
+
+impl PartialEq for Authentication {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Credentials(a), Self::Credentials(b)) => a == b,
+            (Self::Signer(..), Self::Signer(..)) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Authentication {}
+
+impl From<Credentials> for Authentication {
+    fn from(credentials: Credentials) -> Self {
+        Self::Credentials(credentials)
+    }
+}
+
+impl From<DefaultSigner> for Authentication {
+    fn from(signer: DefaultSigner) -> Self {
+        Self::Signer(signer)
+    }
+}
+
+impl Authentication {
+    /// Return the password used for authentication, if any.
+    pub(crate) fn password(&self) -> Option<&str> {
+        match self {
+            Self::Credentials(credentials) => credentials.password(),
+            Self::Signer(..) => None,
+        }
+    }
+
+    /// Return the username used for authentication, if any.
+    pub(crate) fn username(&self) -> Option<&str> {
+        match self {
+            Self::Credentials(credentials) => credentials.username(),
+            Self::Signer(..) => None,
+        }
+    }
+
+    /// Return the username used for authentication, if any.
+    pub(crate) fn as_username(&self) -> Cow<'_, Username> {
+        match self {
+            Self::Credentials(credentials) => credentials.as_username(),
+            Self::Signer(..) => Cow::Owned(Username::none()),
+        }
+    }
+
+    /// Return the username used for authentication, if any.
+    pub(crate) fn to_username(&self) -> Username {
+        match self {
+            Self::Credentials(credentials) => credentials.to_username(),
+            Self::Signer(..) => Username::none(),
+        }
+    }
+
+    /// Return `true` if the object contains a means of authenticating.
+    pub(crate) fn is_authenticated(&self) -> bool {
+        match self {
+            Self::Credentials(credentials) => credentials.is_authenticated(),
+            Self::Signer(..) => true,
+        }
+    }
+
+    /// Return `true` if the object contains no credentials.
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Credentials(credentials) => credentials.is_empty(),
+            Self::Signer(..) => false,
+        }
+    }
+
+    /// Apply the authentication to the given request.
+    ///
+    /// Any existing credentials will be overridden.
+    #[must_use]
+    pub(crate) async fn authenticate(&self, mut request: Request) -> Request {
+        match self {
+            Self::Credentials(credentials) => credentials.authenticate(request),
+            Self::Signer(signer) => {
+                // Build an `http::Request` from the `reqwest::Request`.
+                // SAFETY: If we have a valid `reqwest::Request`, we expect (e.g.) the URL to be valid.
+                let uri = Uri::from_str(request.url().as_str()).unwrap();
+                let mut http_req = http::Request::builder()
+                    .method(request.method().clone())
+                    .uri(uri)
+                    .body(())
+                    .unwrap();
+                *http_req.headers_mut() = request.headers().clone();
+
+                // Sign the parts.
+                let (mut parts, ()) = http_req.into_parts();
+                signer
+                    .sign(&mut parts, None)
+                    .await
+                    .expect("AWS signing should succeed");
+
+                // Copy over the signed headers.
+                request.headers_mut().extend(parts.headers);
+
+                // Copy over the signed path and query, if any.
+                if let Some(path_and_query) = parts.uri.path_and_query() {
+                    request.url_mut().set_path(path_and_query.path());
+                    request.url_mut().set_query(path_and_query.query());
+                }
+                request
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-mod test {
+mod tests {
     use insta::assert_debug_snapshot;
 
     use super::*;
@@ -266,7 +554,7 @@ mod test {
         auth_url.set_password(Some("password")).unwrap();
         let credentials = Credentials::from_url(&auth_url).unwrap();
 
-        let mut request = reqwest::Request::new(reqwest::Method::GET, url);
+        let mut request = Request::new(reqwest::Method::GET, url);
         request = credentials.authenticate(request);
 
         let mut header = request
@@ -288,7 +576,7 @@ mod test {
         auth_url.set_password(Some("password")).unwrap();
         let credentials = Credentials::from_url(&auth_url).unwrap();
 
-        let mut request = reqwest::Request::new(reqwest::Method::GET, url);
+        let mut request = Request::new(reqwest::Method::GET, url);
         request = credentials.authenticate(request);
 
         let mut header = request
@@ -310,7 +598,7 @@ mod test {
         auth_url.set_password(Some("password==")).unwrap();
         let credentials = Credentials::from_url(&auth_url).unwrap();
 
-        let mut request = reqwest::Request::new(reqwest::Method::GET, url);
+        let mut request = Request::new(reqwest::Method::GET, url);
         request = credentials.authenticate(request);
 
         let mut header = request
@@ -322,5 +610,28 @@ mod test {
 
         assert_debug_snapshot!(header, @r###""Basic dXNlcjpwYXNzd29yZD09""###);
         assert_eq!(Credentials::from_header_value(&header), Some(credentials));
+    }
+
+    // Test that we don't include the password in debug messages.
+    #[test]
+    fn test_password_obfuscation() {
+        let credentials =
+            Credentials::basic(Some(String::from("user")), Some(String::from("password")));
+        let debugged = format!("{credentials:?}");
+        assert_eq!(
+            debugged,
+            "Basic { username: Username(Some(\"user\")), password: Some(****) }"
+        );
+    }
+
+    #[test]
+    fn test_bearer_token_obfuscation() {
+        let token = "super_secret_token";
+        let credentials = Credentials::bearer(token.into());
+        let debugged = format!("{credentials:?}");
+        assert!(
+            !debugged.contains(token),
+            "Token should be obfuscated in Debug impl: {debugged}"
+        );
     }
 }

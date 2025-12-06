@@ -1,19 +1,29 @@
-use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::{fmt::Display, fmt::Write};
 
-use anstream::{stream::IsTerminal, ColorChoice};
-use anyhow::{anyhow, Result};
+use anstream::{ColorChoice, stream::IsTerminal};
+use anyhow::{Result, anyhow};
 use clap::CommandFactory;
-use itertools::{Either, Itertools};
+use itertools::Itertools;
 use owo_colors::OwoColorize;
 use which::which;
 
 use super::ExitStatus;
 use crate::printer::Printer;
 use uv_cli::Cli;
+use uv_static::EnvVars;
+
+// hidden subcommands to show in the help command
+const SHOW_HIDDEN_COMMANDS: &[&str] = &["generate-shell-completion"];
 
 pub(crate) fn help(query: &[String], printer: Printer, no_pager: bool) -> Result<ExitStatus> {
-    let mut uv = Cli::command();
+    let mut uv: clap::Command = SHOW_HIDDEN_COMMANDS
+        .iter()
+        .fold(Cli::command(), |uv, &name| {
+            uv.mut_subcommand(name, |cmd| cmd.hide(false))
+        });
 
     // It is very important to build the command before beginning inspection or subcommands
     // will be missing all of the propagated options.
@@ -60,9 +70,9 @@ pub(crate) fn help(query: &[String], printer: Printer, no_pager: bool) -> Result
         .render_long_help()
     };
 
-    let help_ansi = match anstream::Stdout::choice(&std::io::stdout()) {
-        ColorChoice::Always | ColorChoice::AlwaysAnsi => Either::Left(help.ansi()),
-        ColorChoice::Never => Either::Right(help.clone()),
+    let want_color = match anstream::Stdout::choice(&std::io::stdout()) {
+        ColorChoice::Always | ColorChoice::AlwaysAnsi => true,
+        ColorChoice::Never => false,
         // We just asked anstream for a choice, that can't be auto
         ColorChoice::Auto => unreachable!(),
     };
@@ -70,19 +80,19 @@ pub(crate) fn help(query: &[String], printer: Printer, no_pager: bool) -> Result
     let is_terminal = std::io::stdout().is_terminal();
     let should_page = !no_pager && !is_root && is_terminal;
 
-    if should_page {
-        if let Ok(less) = which("less") {
-            // When using less, we use the command name as the file name and can support colors
-            let prompt = format!("help: uv {}", query.join(" "));
-            spawn_pager(less, &["-R", "-P", &prompt], &help_ansi)?;
-        } else if let Ok(more) = which("more") {
-            // When using more, we skip the ANSI color codes
-            spawn_pager(more, &[], &help)?;
+    if should_page && let Some(pager) = Pager::try_from_env() {
+        let query = query.join(" ");
+        if want_color && pager.supports_colors() {
+            pager.spawn(format!("{}: {query}", "uv help".bold()), help.ansi())?;
         } else {
-            writeln!(printer.stdout(), "{help_ansi}")?;
+            pager.spawn(format!("uv help: {query}"), help)?;
         }
     } else {
-        writeln!(printer.stdout(), "{help_ansi}")?;
+        if want_color {
+            writeln!(printer.stdout(), "{}", help.ansi())?;
+        } else {
+            writeln!(printer.stdout(), "{help}")?;
+        }
     }
 
     Ok(ExitStatus::Success)
@@ -103,25 +113,144 @@ fn find_command<'a>(
     find_command(&query[1..], subcommand)
 }
 
-/// Spawn a paging command to display contents.
-fn spawn_pager(command: impl AsRef<OsStr>, args: &[&str], contents: impl Display) -> Result<()> {
-    use std::io::Write;
+#[derive(Debug)]
+enum PagerKind {
+    Less,
+    More,
+    Other(String),
+}
 
-    let mut child = std::process::Command::new(command)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
+#[derive(Debug)]
+struct Pager {
+    kind: PagerKind,
+    args: Vec<String>,
+    path: Option<PathBuf>,
+}
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("Failed to take child process stdin"))?;
+impl PagerKind {
+    fn default_args(&self) -> Vec<String> {
+        match self {
+            Self::Less => vec!["-R".to_string()],
+            Self::More => vec![],
+            Self::Other(_) => vec![],
+        }
+    }
+}
 
-    let contents = contents.to_string();
-    let writer = std::thread::spawn(move || stdin.write_all(contents.as_bytes()));
+impl Display for PagerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Less => write!(f, "less"),
+            Self::More => write!(f, "more"),
+            Self::Other(name) => write!(f, "{name}"),
+        }
+    }
+}
 
-    drop(child.wait());
-    drop(writer.join());
+impl FromStr for Pager {
+    type Err = ();
 
-    Ok(())
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut split = s.split_ascii_whitespace();
+
+        // Empty string
+        let Some(first) = split.next() else {
+            return Err(());
+        };
+
+        match first {
+            "less" => Ok(Self {
+                kind: PagerKind::Less,
+                args: split.map(str::to_string).collect(),
+                path: None,
+            }),
+            "more" => Ok(Self {
+                kind: PagerKind::More,
+                args: split.map(str::to_string).collect(),
+                path: None,
+            }),
+            _ => Ok(Self {
+                kind: PagerKind::Other(first.to_string()),
+                args: split.map(str::to_string).collect(),
+                path: None,
+            }),
+        }
+    }
+}
+
+impl Pager {
+    /// Display `contents` using the pager.
+    fn spawn(self, heading: String, contents: impl Display) -> Result<()> {
+        use std::io::Write;
+
+        let command = self
+            .path
+            .as_ref()
+            .map(|path| path.as_os_str().to_os_string())
+            .unwrap_or(OsString::from(self.kind.to_string()));
+
+        let args = if self.args.is_empty() {
+            self.kind.default_args()
+        } else {
+            self.args
+        };
+
+        let mut child = std::process::Command::new(command)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Failed to take child process stdin"))?;
+
+        let contents = contents.to_string();
+        let writer = std::thread::spawn(move || {
+            let _ = write!(stdin, "{heading}\n\n");
+            let _ = stdin.write_all(contents.as_bytes());
+        });
+
+        drop(child.wait());
+        drop(writer.join());
+
+        Ok(())
+    }
+
+    /// Get a pager to use and its path, if available.
+    ///
+    /// Supports the `PAGER` environment variable, otherwise checks for `less` and `more` in the
+    /// search path.
+    fn try_from_env() -> Option<Self> {
+        if let Some(pager) = std::env::var_os(EnvVars::PAGER) {
+            if !pager.is_empty() {
+                return Self::from_str(&pager.to_string_lossy()).ok();
+            }
+        }
+
+        if let Ok(less) = which("less") {
+            Some(Self {
+                kind: PagerKind::Less,
+                args: vec![],
+                path: Some(less),
+            })
+        } else if let Ok(more) = which("more") {
+            Some(Self {
+                kind: PagerKind::More,
+                args: vec![],
+                path: Some(more),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn supports_colors(&self) -> bool {
+        match self.kind {
+            // The `-R` flag is required for color support. We will provide it by default.
+            PagerKind::Less => self.args.is_empty() || self.args.iter().any(|arg| arg == "-R"),
+            PagerKind::More => false,
+            PagerKind::Other(_) => false,
+        }
+    }
 }

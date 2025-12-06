@@ -4,40 +4,28 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use configparser::ini::Ini;
-use futures::{stream::FuturesOrdered, TryStreamExt};
+use futures::{TryStreamExt, stream::FuturesOrdered};
 use serde::Deserialize;
 use tracing::debug;
 use url::Host;
 
-use distribution_filename::{SourceDistFilename, WheelFilename};
-use distribution_types::{
-    BuildableSource, DirectSourceUrl, DirectorySourceUrl, GitSourceUrl, PathSourceUrl,
-    RemoteSource, SourceUrl, UnresolvedRequirement, UnresolvedRequirementSpecification, VersionId,
-};
-use pep508_rs::{UnnamedRequirement, VersionOrUrl};
-use pypi_types::Requirement;
-use pypi_types::{Metadata10, ParsedUrl, VerbatimParsedUrl};
 use uv_distribution::{DistributionDatabase, Reporter};
+use uv_distribution_filename::{DistExtension, SourceDistFilename, WheelFilename};
+use uv_distribution_types::{
+    BuildableSource, DirectSourceUrl, DirectorySourceUrl, GitSourceUrl, PathSourceUrl,
+    RemoteSource, Requirement, SourceUrl, VersionId,
+};
 use uv_normalize::PackageName;
+use uv_pep508::{UnnamedRequirement, VersionOrUrl};
+use uv_pypi_types::Metadata10;
+use uv_pypi_types::{ParsedUrl, VerbatimParsedUrl};
 use uv_resolver::{InMemoryIndex, MetadataResponse};
 use uv_types::{BuildContext, HashStrategy};
 
-#[derive(Debug, thiserror::Error)]
-pub enum NamedRequirementsError {
-    #[error(transparent)]
-    Distribution(#[from] uv_distribution::Error),
-
-    #[error(transparent)]
-    DistributionTypes(#[from] distribution_types::Error),
-
-    #[error(transparent)]
-    WheelFilename(#[from] distribution_filename::WheelFilenameError),
-}
+use crate::Error;
 
 /// Like [`RequirementsSpecification`], but with concrete names for all requirements.
 pub struct NamedRequirementsResolver<'a, Context: BuildContext> {
-    /// The requirements for the project.
-    requirements: Vec<UnresolvedRequirementSpecification>,
     /// Whether to check hashes for distributions.
     hasher: &'a HashStrategy,
     /// The in-memory index for resolving dependencies.
@@ -47,15 +35,13 @@ pub struct NamedRequirementsResolver<'a, Context: BuildContext> {
 }
 
 impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
-    /// Instantiate a new [`NamedRequirementsResolver`] for a given set of requirements.
+    /// Instantiate a new [`NamedRequirementsResolver`].
     pub fn new(
-        requirements: Vec<UnresolvedRequirementSpecification>,
         hasher: &'a HashStrategy,
         index: &'a InMemoryIndex,
         database: DistributionDatabase<'a, Context>,
     ) -> Self {
         Self {
-            requirements,
             hasher,
             index,
             database,
@@ -64,7 +50,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
 
     /// Set the [`Reporter`] to use for this resolver.
     #[must_use]
-    pub fn with_reporter(self, reporter: impl Reporter + 'static) -> Self {
+    pub fn with_reporter(self, reporter: Arc<dyn Reporter>) -> Self {
         Self {
             database: self.database.with_reporter(reporter),
             ..self
@@ -72,22 +58,20 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
     }
 
     /// Resolve any unnamed requirements in the specification.
-    pub async fn resolve(self) -> Result<Vec<Requirement>, NamedRequirementsError> {
+    pub async fn resolve(
+        self,
+        requirements: impl Iterator<Item = UnnamedRequirement<VerbatimParsedUrl>>,
+    ) -> Result<Vec<Requirement>, Error> {
         let Self {
-            requirements,
             hasher,
             index,
             database,
         } = self;
         requirements
-            .into_iter()
-            .map(|entry| async {
-                match entry.requirement {
-                    UnresolvedRequirement::Named(requirement) => Ok(requirement),
-                    UnresolvedRequirement::Unnamed(requirement) => Ok(Requirement::from(
-                        Self::resolve_requirement(requirement, hasher, index, &database).await?,
-                    )),
-                }
+            .map(async |requirement| {
+                Self::resolve_requirement(requirement, hasher, index, &database)
+                    .await
+                    .map(Requirement::from)
             })
             .collect::<FuturesOrdered<_>>()
             .try_collect()
@@ -100,7 +84,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
         hasher: &HashStrategy,
         index: &InMemoryIndex,
         database: &DistributionDatabase<'a, Context>,
-    ) -> Result<pep508_rs::Requirement<VerbatimParsedUrl>, NamedRequirementsError> {
+    ) -> Result<uv_pep508::Requirement<VerbatimParsedUrl>, Error> {
         // If the requirement is a wheel, extract the package name from the wheel filename.
         //
         // Ex) `anyio-4.3.0-py3-none-any.whl`
@@ -109,7 +93,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("whl"))
         {
             let filename = WheelFilename::from_str(&requirement.url.verbatim.filename()?)?;
-            return Ok(pep508_rs::Requirement {
+            return Ok(uv_pep508::Requirement {
                 name: filename.name,
                 extras: requirement.extras,
                 version_or_url: Some(VersionOrUrl::Url(requirement.url)),
@@ -147,7 +131,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
                     requirement.url.verbatim
                 );
             } else {
-                return Ok(pep508_rs::Requirement {
+                return Ok(uv_pep508::Requirement {
                     name: filename.name,
                     extras: requirement.extras,
                     version_or_url: Some(VersionOrUrl::Url(requirement.url)),
@@ -171,7 +155,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
                         path = parsed_directory_url.install_path.display(),
                         name = metadata.name
                     );
-                    return Ok(pep508_rs::Requirement {
+                    return Ok(uv_pep508::Requirement {
                         name: metadata.name,
                         extras: requirement.extras,
                         version_or_url: Some(VersionOrUrl::Url(requirement.url)),
@@ -193,7 +177,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
                             path = parsed_directory_url.install_path.display(),
                             name = project.name
                         );
-                        return Ok(pep508_rs::Requirement {
+                        return Ok(uv_pep508::Requirement {
                             name: project.name,
                             extras: requirement.extras,
                             version_or_url: Some(VersionOrUrl::Url(requirement.url)),
@@ -211,7 +195,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
                                     path = parsed_directory_url.install_path.display(),
                                     name = name
                                 );
-                                return Ok(pep508_rs::Requirement {
+                                return Ok(uv_pep508::Requirement {
                                     name,
                                     extras: requirement.extras,
                                     version_or_url: Some(VersionOrUrl::Url(requirement.url)),
@@ -241,7 +225,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
                                     path = parsed_directory_url.install_path.display(),
                                     name = name
                                 );
-                                return Ok(pep508_rs::Requirement {
+                                return Ok(uv_pep508::Requirement {
                                     name,
                                     extras: requirement.extras,
                                     version_or_url: Some(VersionOrUrl::Url(requirement.url)),
@@ -256,17 +240,31 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
                 SourceUrl::Directory(DirectorySourceUrl {
                     url: &requirement.url.verbatim,
                     install_path: Cow::Borrowed(&parsed_directory_url.install_path),
-                    lock_path: Cow::Borrowed(&parsed_directory_url.lock_path),
                     editable: parsed_directory_url.editable,
                 })
             }
-            ParsedUrl::Path(parsed_path_url) => SourceUrl::Path(PathSourceUrl {
-                url: &requirement.url.verbatim,
-                path: Cow::Borrowed(&parsed_path_url.install_path),
-            }),
-            ParsedUrl::Archive(parsed_archive_url) => SourceUrl::Direct(DirectSourceUrl {
-                url: &parsed_archive_url.url,
-            }),
+            ParsedUrl::Path(parsed_path_url) => {
+                let ext = match parsed_path_url.ext {
+                    DistExtension::Source(ext) => ext,
+                    DistExtension::Wheel => unreachable!(),
+                };
+                SourceUrl::Path(PathSourceUrl {
+                    url: &requirement.url.verbatim,
+                    path: Cow::Borrowed(&parsed_path_url.install_path),
+                    ext,
+                })
+            }
+            ParsedUrl::Archive(parsed_archive_url) => {
+                let ext = match parsed_archive_url.ext {
+                    DistExtension::Source(ext) => ext,
+                    DistExtension::Wheel => unreachable!(),
+                };
+                SourceUrl::Direct(DirectSourceUrl {
+                    url: &parsed_archive_url.url,
+                    subdirectory: parsed_archive_url.subdirectory.as_deref(),
+                    ext,
+                })
+            }
             ParsedUrl::Git(parsed_git_url) => SourceUrl::Git(GitSourceUrl {
                 url: &requirement.url.verbatim,
                 git: &parsed_git_url.url,
@@ -308,7 +306,7 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
             }
         };
 
-        Ok(pep508_rs::Requirement {
+        Ok(uv_pep508::Requirement {
             name,
             extras: requirement.extras,
             version_or_url: Some(VersionOrUrl::Url(requirement.url)),

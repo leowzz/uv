@@ -3,25 +3,30 @@ use std::time::Instant;
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
-use tracing::debug;
 
-use distribution_types::{Diagnostic, InstalledDist};
 use uv_cache::Cache;
-use uv_configuration::PreviewMode;
-use uv_fs::Simplified;
+use uv_configuration::TargetTriple;
+use uv_distribution_types::{Diagnostic, InstalledDist};
 use uv_installer::{SitePackages, SitePackagesDiagnostic};
-use uv_python::{EnvironmentPreference, PythonEnvironment, PythonRequest};
+use uv_preview::Preview;
+use uv_python::{
+    EnvironmentPreference, PythonEnvironment, PythonPreference, PythonRequest, PythonVersion,
+};
 
-use crate::commands::{elapsed, ExitStatus};
+use crate::commands::pip::operations::report_target_environment;
+use crate::commands::pip::{resolution_markers, resolution_tags};
+use crate::commands::{ExitStatus, elapsed};
 use crate::printer::Printer;
 
 /// Check for incompatibilities in installed packages.
 pub(crate) fn pip_check(
     python: Option<&str>,
     system: bool,
-    _preview: PreviewMode,
+    python_version: Option<&PythonVersion>,
+    python_platform: Option<&TargetTriple>,
     cache: &Cache,
     printer: Printer,
+    preview: Preview,
 ) -> Result<ExitStatus> {
     let start = Instant::now();
 
@@ -29,14 +34,12 @@ pub(crate) fn pip_check(
     let environment = PythonEnvironment::find(
         &python.map(PythonRequest::parse).unwrap_or_default(),
         EnvironmentPreference::from_system_flag(system, false),
+        PythonPreference::default().with_system_flag(system),
         cache,
+        preview,
     )?;
 
-    debug!(
-        "Using Python {} environment at {}",
-        environment.interpreter().python_version(),
-        environment.python_executable().user_display().cyan()
-    );
+    report_target_environment(&environment, cache, printer)?;
 
     // Build the installed index.
     let site_packages = SitePackages::from_environment(&environment)?;
@@ -54,8 +57,15 @@ pub(crate) fn pip_check(
         .dimmed()
     )?;
 
-    let diagnostics: Vec<SitePackagesDiagnostic> =
-        site_packages.diagnostics()?.into_iter().collect();
+    // Determine the markers and tags to use for resolution.
+    let markers = resolution_markers(python_version, python_platform, environment.interpreter());
+    let tags = resolution_tags(python_version, python_platform, environment.interpreter())?;
+
+    // Run the diagnostics.
+    let diagnostics: Vec<SitePackagesDiagnostic> = site_packages
+        .diagnostics(&markers, &tags)?
+        .into_iter()
+        .collect();
 
     if diagnostics.is_empty() {
         writeln!(

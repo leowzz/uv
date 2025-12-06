@@ -1,13 +1,12 @@
 [package]
 name = "uv-dev"
-version = "0.0.1"
-description = "Build wheels from source distributions"
+version = "0.0.5"
+description = "This is an internal component crate of uv"
 publish = false
 
 edition = { workspace = true }
 rust-version = { workspace = true }
 homepage = { workspace = true }
-documentation = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -16,25 +15,22 @@ license = { workspace = true }
 workspace = true
 
 [dependencies]
-distribution-filename = { workspace = true }
-distribution-types = { workspace = true }
-install-wheel-rs = { workspace = true }
-pep508_rs = { workspace = true }
-pypi-types = { workspace = true }
-uv-build = { workspace = true }
 uv-cache = { workspace = true, features = ["clap"] }
 uv-cli = { workspace = true }
 uv-client = { workspace = true }
 uv-configuration = { workspace = true }
-uv-dispatch = { workspace = true }
-uv-git = { workspace = true }
+uv-distribution-filename = { workspace = true }
+uv-distribution-types = { workspace = true }
+uv-extract = { workspace = true }
 uv-installer = { workspace = true }
 uv-macros = { workspace = true }
 uv-options-metadata = { workspace = true }
+uv-pep508 = { workspace = true }
+uv-preview = { workspace = true }
+uv-pypi-types = { workspace = true }
 uv-python = { workspace = true }
-uv-resolver = { workspace = true }
 uv-settings = { workspace = true, features = ["schemars"] }
-uv-types = { workspace = true }
+uv-static = { workspace = true }
 uv-workspace = { workspace = true, features = ["schemars"] }
 
 # Any dependencies that are exclusively used in `uv-dev` should be listed as non-workspace
@@ -43,30 +39,44 @@ anstream = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "wrap_help"] }
 fs-err = { workspace = true, features = ["tokio"] }
+futures = { workspace = true }
 itertools = { workspace = true }
-markdown = "0.3.0"
+markdown = { version = "1.0.0" }
 owo-colors = { workspace = true }
 poloto = { version = "19.1.2", optional = true }
-pretty_assertions = { version = "1.4.0" }
+pretty_assertions = { version = "1.4.1" }
+reqwest = { workspace = true, features = ["stream"] }
 resvg = { version = "0.29.0", optional = true }
-rustc-hash = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { version = "0.9.34" }
 tagu = { version = "0.1.6", optional = true }
+tempfile = { workspace = true }
 textwrap = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-durations-export = { workspace = true, features = ["plot"] }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uv-performance-memory-allocator = { path = "../uv-performance-memory-allocator", optional = true }
 walkdir = { workspace = true }
 
-[target.'cfg(target_os = "windows")'.dependencies]
-mimalloc = { version = "0.1.39" }
+[lib]
+name = "uv_dev"
 
-[target.'cfg(all(not(target_os = "windows"), not(target_os = "openbsd"), any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64")))'.dependencies]
-tikv-jemallocator = { version = "0.6.0" }
+[[bin]]
+name = "uv-dev"
+# We don't want to build the dev CLI by default, so we skip it by requiring an off-by-default feature
+required-features = ["dev"]
 
 [features]
-default = []
+default = ["performance", "uv-extract/static"]
+# Actually build the dev CLI.
+dev = []
+performance = ["performance-memory-allocator"]
+performance-memory-allocator = ["dep:uv-performance-memory-allocator"]
 render = ["poloto", "resvg", "tagu"]
+
+[package.metadata.cargo-shear]
+ignored = ["flate2", "uv-extract", "uv-performance-memory-allocator"]

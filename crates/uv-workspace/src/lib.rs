@@ -1,8 +1,10 @@
 pub use workspace::{
-    check_nested_workspaces, DiscoveryOptions, ProjectWorkspace, VirtualProject, Workspace,
-    WorkspaceError, WorkspaceMember,
+    DiscoveryOptions, Editability, MemberDiscovery, ProjectDiscovery, ProjectWorkspace,
+    RequiresPythonSources, VirtualProject, Workspace, WorkspaceCache, WorkspaceError,
+    WorkspaceMember,
 };
 
+pub mod dependency_groups;
 pub mod pyproject;
 pub mod pyproject_mut;
 mod workspace;

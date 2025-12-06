@@ -1,20 +1,24 @@
 use std::convert::Infallible;
 use std::ffi::CString;
+use std::io::Write;
+use std::os::windows::io::AsRawHandle;
 use std::string::String;
 
 use ufmt_write::uWrite;
+use windows::Win32::UI::WindowsAndMessaging::{MESSAGEBOX_STYLE, MessageBoxA};
 use windows::core::PCSTR;
-use windows::Win32::{
-    Foundation::INVALID_HANDLE_VALUE,
-    Storage::FileSystem::WriteFile,
-    System::Console::{GetStdHandle, STD_ERROR_HANDLE},
-    UI::WindowsAndMessaging::{MessageBoxA, MESSAGEBOX_STYLE},
-};
 
 #[macro_export]
-macro_rules! eprintln {
+macro_rules! error {
     ($($tt:tt)*) => {{
-        $crate::diagnostics::write_diagnostic(&$crate::format!($($tt)*));
+        $crate::diagnostics::write_diagnostic(&$crate::format!($($tt)*), true);
+    }}
+}
+
+#[macro_export]
+macro_rules! warn {
+    ($($tt:tt)*) => {{
+        $crate::diagnostics::write_diagnostic(&$crate::format!($($tt)*), false);
     }}
 }
 
@@ -40,23 +44,13 @@ impl uWrite for StringBuffer {
 }
 
 #[cold]
-pub(crate) fn write_diagnostic(message: &str) {
-    let handle = unsafe { GetStdHandle(STD_ERROR_HANDLE) }.unwrap_or(INVALID_HANDLE_VALUE);
-    let mut written: u32 = 0;
-    let mut remaining = message;
-    while !remaining.is_empty() {
-        // If we get an error, it means we tried to write to an invalid handle (GUI Application)
-        // and we should try to write to a window instead
-        if unsafe { WriteFile(handle, Some(remaining.as_bytes()), Some(&mut written), None) }
-            .is_err()
-        {
-            let nul_terminated = unsafe { CString::new(message.as_bytes()).unwrap_unchecked() };
-            let pcstr_message = PCSTR::from_raw(nul_terminated.as_ptr() as *const _);
-            unsafe { MessageBoxA(None, pcstr_message, None, MESSAGEBOX_STYLE(0)) };
-            return;
-        }
-        if let Some(out) = remaining.get(written as usize..) {
-            remaining = out
-        }
+pub(crate) fn write_diagnostic(message: &str, is_error: bool) {
+    let mut stderr = std::io::stderr();
+    if !stderr.as_raw_handle().is_null() {
+        let _ = stderr.write_all(message.as_bytes());
+    } else if is_error {
+        let nul_terminated = unsafe { CString::new(message.as_bytes()).unwrap_unchecked() };
+        let pcstr_message = PCSTR::from_raw(nul_terminated.as_ptr() as *const _);
+        unsafe { MessageBoxA(None, pcstr_message, None, MESSAGEBOX_STYLE(0)) };
     }
 }

@@ -2,14 +2,13 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::FxHashMap;
 
-use distribution_types::Verbatim;
-use pypi_types::VerbatimParsedUrl;
 use uv_normalize::PackageName;
+use uv_pypi_types::VerbatimParsedUrl;
 
-use crate::resolver::ResolverMarkers;
 use crate::ResolveError;
+use crate::resolver::ResolverEnvironment;
 
-/// See [`crate::resolver::SolveState`].
+/// See [`crate::resolver::ForkState`].
 #[derive(Default, Debug, Clone)]
 pub(crate) struct ForkUrls(FxHashMap<PackageName, VerbatimParsedUrl>);
 
@@ -29,32 +28,19 @@ impl ForkUrls {
         &mut self,
         package_name: &PackageName,
         url: &VerbatimParsedUrl,
-        fork_markers: &ResolverMarkers,
+        env: &ResolverEnvironment,
     ) -> Result<(), ResolveError> {
         match self.0.entry(package_name.clone()) {
             Entry::Occupied(previous) => {
                 if previous.get() != url {
-                    let mut conflicting_url = vec![
-                        previous.get().verbatim.verbatim().to_string(),
-                        url.verbatim.verbatim().to_string(),
-                    ];
+                    let mut conflicting_url =
+                        vec![previous.get().parsed_url.clone(), url.parsed_url.clone()];
                     conflicting_url.sort();
-                    return match fork_markers {
-                        ResolverMarkers::Universal { .. }
-                        | ResolverMarkers::SpecificEnvironment(_) => {
-                            Err(ResolveError::ConflictingUrlsUniversal(
-                                package_name.clone(),
-                                conflicting_url,
-                            ))
-                        }
-                        ResolverMarkers::Fork(fork_markers) => {
-                            Err(ResolveError::ConflictingUrlsFork {
-                                package_name: package_name.clone(),
-                                urls: conflicting_url,
-                                fork_markers: fork_markers.clone(),
-                            })
-                        }
-                    };
+                    return Err(ResolveError::ConflictingUrls {
+                        package_name: package_name.clone(),
+                        urls: conflicting_url,
+                        env: env.clone(),
+                    });
                 }
             }
             Entry::Vacant(vacant) => {

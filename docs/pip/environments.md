@@ -1,4 +1,4 @@
-# Python environments
+# Using Python environments
 
 Each Python installation has an environment that is active when Python is used. Packages can be
 installed into an environment to make their modules available from your Python scripts. Generally,
@@ -9,51 +9,84 @@ installation's environment. Unlike `pip`, uv requires using a virtual environmen
 
 ## Creating a virtual environment
 
-uv supports creating virtual environments:
+uv supports creating virtual environments, e.g., to create a virtual environment at `.venv`:
 
-```bash
-# Create a virtual environment at `.venv`
-uv venv
+```console
+$ uv venv
 ```
 
-A specific name or path can be specified:
+A specific name or path can be specified, e.g., to create a virtual environment at `my-name`:
 
-```bash
-# Create a virtual environment at `my-name`
-uv venv my-name
+```console
+$ uv venv my-name
 ```
 
-A Python version can be requested:
+A Python version can be requested, e.g., to create a virtual environment with Python 3.11:
 
-```bash
-# Create a virtual environment with Python 3.11
-uv venv --python 3.11
+```console
+$ uv venv --python 3.11
 ```
 
 Note this requires the requested Python version to be available on the system. However, if
-available, uv will download Python for you. See the [Python version](../concepts/python-versions.md)
-documentation for more details.
+unavailable, uv will download Python for you. See the
+[Python version](../concepts/python-versions.md) documentation for more details.
 
 ## Using a virtual environment
 
 When using the default virtual environment name, uv will automatically find and use the virtual
 environment during subsequent invocations.
 
-```bash
-uv venv
+```console
+$ uv venv
 
-# Install a package in the new virtual environment
-uv pip install ruff
+$ # Install a package in the new virtual environment
+$ uv pip install ruff
 ```
 
 The virtual environment can be "activated" to make its packages available:
 
-```bash
-# On macOS and Linux.
-source .venv/bin/activate
+=== "macOS and Linux"
 
-# On Windows.
-.venv\Scripts\activate
+    ```console
+    $ source .venv/bin/activate
+    ```
+
+=== "Windows"
+
+    ```pwsh-session
+    PS> .venv\Scripts\activate
+    ```
+
+!!! note
+
+    The default activation script on Unix is for POSIX compliant shells like `sh`, `bash`, or `zsh`.
+    There are additional activation scripts for common alternative shells.
+
+    === "fish"
+
+        ```console
+        $ source .venv/bin/activate.fish
+        ```
+
+    === "csh / tcsh"
+
+
+        ```console
+        $ source .venv/bin/activate.csh
+        ```
+
+    === "Nushell"
+
+        ```console
+        $ use .venv\Scripts\activate.nu
+        ```
+
+## Deactivating an environment
+
+To exit a virtual environment, use the `deactivate` command:
+
+```console
+$ deactivate
 ```
 
 ## Using arbitrary Python environments
@@ -75,7 +108,7 @@ executables that are linked to virtual environments will be skipped. Although we
 using virtual environments for dependency management, `--system` is appropriate in continuous
 integration and containerized environments.
 
-The `--system` flag is also used to opt in to mutating system environments. For example, the the
+The `--system` flag is also used to opt in to mutating system environments. For example, the
 `--python` argument can be used to request a Python version (e.g., `--python 3.12`), and uv will
 search for an interpreter that meets the request. If uv finds a system interpreter (e.g.,
 `/usr/lib/python3.12`), then the `--system` flag is required to allow modification of this
@@ -110,18 +143,9 @@ will search for a virtual environment in the following order:
 If no virtual environment is found, uv will prompt the user to create one in the current directory
 via `uv venv`.
 
-If the `--system` flag is included, uv will skip virtual environments and search for:
-
-- The Python interpreter available as `python3` on macOS and Linux, or `python.exe` on Windows.
-- On Windows, the Python interpreter returned by `py --list-paths` that matches the requested
-  version.
-
-If a specific Python version is requested, e.g., `--python 3.7`, additional executable names are
-included:
-
-- The Python interpreter available as, e.g., `python3.7` on macOS and Linux.
-
-When running a command that does not mutate the environment such as `uv pip compile`, uv does not
-_require_ a virtual environment. Instead, it needs a Python toolchain to create ephemeral
-environments. See the documentation on
-[toolchain discovery](../concepts/python-versions.md#discovery-order) for details on discovery.
+If the `--system` flag is included, uv will skip virtual environments search for an installed Python
+version. Similarly, when running a command that does not mutate the environment such as
+`uv pip compile`, uv does not _require_ a virtual environment — however, a Python interpreter is
+still required. See the documentation on
+[Python discovery](../concepts/python-versions.md#discovery-of-python-versions) for details on the
+discovery of installed Python versions.

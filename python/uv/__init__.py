@@ -1,41 +1,24 @@
 from __future__ import annotations
 
-import os
-import sys
-import sysconfig
+from ._find_uv import find_uv_bin
+
+__all__ = ["find_uv_bin"]
 
 
-def find_uv_bin() -> str:
-    """Return the uv binary path."""
-
-    uv_exe = "uv" + sysconfig.get_config_var("EXE")
-
-    path = os.path.join(sysconfig.get_path("scripts"), uv_exe)
-    if os.path.isfile(path):
-        return path
-
-    if sys.version_info >= (3, 10):
-        user_scheme = sysconfig.get_preferred_scheme("user")
-    elif os.name == "nt":
-        user_scheme = "nt_user"
-    elif sys.platform == "darwin" and sys._framework:
-        user_scheme = "osx_framework_user"
-    else:
-        user_scheme = "posix_user"
-
-    path = os.path.join(sysconfig.get_path("scripts", scheme=user_scheme), uv_exe)
-    if os.path.isfile(path):
-        return path
-
-    # Search in `bin` adjacent to package root (as created by `pip install --target`).
-    pkg_root = os.path.dirname(os.path.dirname(__file__))
-    target_path = os.path.join(pkg_root, "bin", uv_exe)
-    if os.path.isfile(target_path):
-        return target_path
-
-    raise FileNotFoundError(path)
-
-
-__all__ = [
-    "find_uv_bin",
-]
+def __getattr__(attr_name: str) -> object:
+    if attr_name in {
+        "build_sdist",
+        "build_wheel",
+        "build_editable",
+        "get_requires_for_build_sdist",
+        "get_requires_for_build_wheel",
+        "prepare_metadata_for_build_wheel",
+        "get_requires_for_build_editable",
+        "prepare_metadata_for_build_editable",
+    }:
+        err = (
+            f"Using `uv.{attr_name}` is not allowed; build backend functionality is in the `uv_build` package. "
+            f"Did you mean to use `uv_build` as your build system?"
+        )
+        raise AttributeError(err)
+    raise AttributeError(f"module `{__name__}` has no attribute `{attr_name}`")

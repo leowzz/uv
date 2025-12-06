@@ -4,6 +4,7 @@ Queries information about the current Python interpreter and prints it as JSON.
 The script will exit with status 0 on known error that are turned into rust errors.
 """
 
+import site
 import sys
 
 import json
@@ -34,8 +35,29 @@ if sys.version_info[0] < 3:
     sys.exit(0)
 
 if hasattr(sys, "implementation"):
-    implementation_version = format_full_version(sys.implementation.version)
     implementation_name = sys.implementation.name
+    if implementation_name == "graalpy":
+        # GraalPy reports the CPython version as sys.implementation.version,
+        # so we need to discover the GraalPy version from the cache_tag
+        import re
+
+        implementation_version = re.sub(
+            r"graalpy(\d)(\d+)(?:dev[\da-f]+)?-\d+",
+            r"\1.\2",
+            sys.implementation.cache_tag,
+        )
+    elif implementation_name == "pyston":
+        # Pyston reports the CPython version as sys.implementation.version,
+        # so we need to discover the Pyston version from the cache_tag
+        import re
+
+        implementation_version = re.sub(
+            r"pyston-(\d)(\d+)",
+            r"\1.\2",
+            sys.implementation.cache_tag,
+        )
+    else:
+        implementation_version = format_full_version(sys.implementation.version)
 else:
     implementation_version = "0"
     implementation_name = ""
@@ -176,6 +198,9 @@ def get_virtualenv():
             "data": expand_path(sysconfig_paths["data"]),
         }
     else:
+        # Use distutils primarily because that's what pip does.
+        # https://github.com/pypa/pip/blob/ae5fff36b0aad6e5e0037884927eaa29163c0611/src/pip/_internal/locations/__init__.py#L249
+
         # Disable the use of the setuptools shim, if it's injected. Per pip:
         #
         # > If pip's going to use distutils, it should not be using the copy that setuptools
@@ -189,8 +214,6 @@ def get_virtualenv():
         except (ImportError, AttributeError):
             pass
 
-        # Use distutils primarily because that's what pip does.
-        # https://github.com/pypa/pip/blob/ae5fff36b0aad6e5e0037884927eaa29163c0611/src/pip/_internal/locations/__init__.py#L249
         import warnings
 
         with warnings.catch_warnings():  # disable warning for PEP-632
@@ -224,7 +247,7 @@ def get_virtualenv():
         }
 
 
-def get_scheme():
+def get_scheme(use_sysconfig_scheme: bool):
     """Return the Scheme for the current interpreter.
 
     The paths returned should be absolute.
@@ -337,19 +360,6 @@ def get_scheme():
         Based on (with default arguments):
             https://github.com/pypa/pip/blob/ae5fff36b0aad6e5e0037884927eaa29163c0611/src/pip/_internal/locations/_distutils.py#L115
         """
-        # Disable the use of the setuptools shim, if it's injected. Per pip:
-        #
-        # > If pip's going to use distutils, it should not be using the copy that setuptools
-        # > might have injected into the environment. This is done by removing the injected
-        # > shim, if it's injected.
-        #
-        # > See https://github.com/pypa/pip/issues/8761 for the original discussion and
-        # > rationale for why this is done within pip.
-        try:
-            __import__("_distutils_hack").remove_shim()
-        except (ImportError, AttributeError):
-            pass
-
         import warnings
 
         with warnings.catch_warnings():  # disable warning for PEP-632
@@ -401,15 +411,7 @@ def get_scheme():
             "data": scheme["data"],
         }
 
-    # By default, pip uses sysconfig on Python 3.10+.
-    # But Python distributors can override this decision by setting:
-    #     sysconfig._PIP_USE_SYSCONFIG = True / False
-    # Rationale in https://github.com/pypa/pip/issues/10647
-    use_sysconfig = bool(
-        getattr(sysconfig, "_PIP_USE_SYSCONFIG", sys.version_info >= (3, 10))
-    )
-
-    if use_sysconfig:
+    if use_sysconfig_scheme:
         return get_sysconfig_scheme()
     else:
         return get_distutils_scheme()
@@ -442,27 +444,36 @@ def get_operating_system_and_architecture():
         version = None
         architecture = version_arch
 
-    if operating_system == "linux":
-        if sys.version_info < (3, 7):
-            print(
-                json.dumps(
-                    {
-                        "result": "error",
-                        "kind": "unsupported_python_version",
-                        "python_version": format_full_version(sys.version_info),
-                    }
-                )
+    if sys.version_info < (3, 7):
+        print(
+            json.dumps(
+                {
+                    "result": "error",
+                    "kind": "unsupported_python_version",
+                    "python_version": format_full_version(sys.version_info),
+                }
             )
-            sys.exit(0)
+        )
+        sys.exit(0)
 
+    if operating_system == "linux":
         # noinspection PyProtectedMember
         from .packaging._manylinux import _get_glibc_version
 
         # noinspection PyProtectedMember
         from .packaging._musllinux import _get_musl_version
 
+        # https://github.com/pypa/packaging/blob/4dc334c86d43f83371b194ca91618ed99e0e49ca/src/packaging/tags.py#L539-L543
+        # https://github.com/astral-sh/uv/issues/9842
+        if struct.calcsize("P") == 4:
+            if architecture == "x86_64":
+                architecture = "i686"
+            elif architecture == "aarch64":
+                architecture = "armv8l"
+
         musl_version = _get_musl_version(sys.executable)
         glibc_version = _get_glibc_version()
+
         if musl_version:
             operating_system = {
                 "name": "musllinux",
@@ -474,6 +485,11 @@ def get_operating_system_and_architecture():
                 "name": "manylinux",
                 "major": glibc_version[0],
                 "minor": glibc_version[1],
+            }
+        elif hasattr(sys, "getandroidapilevel"):
+            operating_system = {
+                "name": "android",
+                "api_level": sys.getandroidapilevel(),
             }
         else:
             print(json.dumps({"result": "error", "kind": "libc_not_found"}))
@@ -488,6 +504,10 @@ def get_operating_system_and_architecture():
         # https://github.com/astral-sh/uv/issues/2450
         version, _, architecture = platform.mac_ver()
 
+        if not version or not architecture:
+            print(json.dumps({"result": "error", "kind": "broken_mac_ver"}))
+            sys.exit(0)
+
         # https://github.com/pypa/packaging/blob/cc938f984bbbe43c5734b9656c9837ab3a28191f/src/packaging/tags.py#L356-L363
         is_32bit = struct.calcsize("P") == 4
         if is_32bit:
@@ -499,6 +519,33 @@ def get_operating_system_and_architecture():
         version = version.split(".")
         operating_system = {
             "name": "macos",
+            "major": int(version[0]),
+            "minor": int(version[1]),
+        }
+    elif operating_system == "ios":
+        ios_ver = platform.ios_ver()
+        version = ios_ver.release.split(".")
+        operating_system = {
+            "name": "ios",
+            "major": int(version[0]),
+            "minor": int(version[1]),
+            "simulator": ios_ver.is_simulator,
+        }
+    elif operating_system == "emscripten":
+        pyodide_abi_version = sysconfig.get_config_var("PYODIDE_ABI_VERSION")
+        if not pyodide_abi_version:
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "kind": "emscripten_not_pyodide",
+                    }
+                )
+            )
+            sys.exit(0)
+        version = pyodide_abi_version.split("_")
+        operating_system = {
+            "name": "pyodide",
             "major": int(version[0]),
             "minor": int(version[1]),
         }
@@ -542,6 +589,62 @@ def main() -> None:
         "python_version": ".".join(platform.python_version_tuple()[:2]),
         "sys_platform": sys.platform,
     }
+
+    os_and_arch = get_operating_system_and_architecture()
+
+    manylinux_compatible = False
+
+    if os_and_arch["os"]["name"] == "manylinux":
+        # noinspection PyProtectedMember
+        from .packaging._manylinux import _get_glibc_version, _is_compatible
+
+        manylinux_compatible = _is_compatible(
+            arch=os_and_arch["arch"], version=_get_glibc_version()
+        )
+    elif os_and_arch["os"]["name"] == "musllinux":
+        manylinux_compatible = True
+
+    # By default, pip uses sysconfig on Python 3.10+.
+    # But Python distributors can override this decision by setting:
+    #     sysconfig._PIP_USE_SYSCONFIG = True / False
+    # Rationale in https://github.com/pypa/pip/issues/10647
+    use_sysconfig_scheme = bool(
+        getattr(sysconfig, "_PIP_USE_SYSCONFIG", sys.version_info >= (3, 10))
+    )
+
+    # If we're not using sysconfig, make sure distutils is available.
+    if not use_sysconfig_scheme:
+        try:
+            # Disable the use of the setuptools shim, if it's injected. Per pip:
+            #
+            # > If pip's going to use distutils, it should not be using the copy that setuptools
+            # > might have injected into the environment. This is done by removing the injected
+            # > shim, if it's injected.
+            #
+            # > See https://github.com/pypa/pip/issues/8761 for the original discussion and
+            # > rationale for why this is done within pip.
+            try:
+                __import__("_distutils_hack").remove_shim()
+            except (ImportError, AttributeError):
+                pass
+
+            import distutils.dist  # noqa: F401
+        except ImportError:
+            # We require distutils, but it's not installed; this is fairly
+            # common in, e.g., deadsnakes where distutils is packaged
+            # separately from Python.
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "kind": "missing_required_distutils",
+                        "python_major": sys.version_info[0],
+                        "python_minor": sys.version_info[1],
+                    }
+                )
+            )
+            sys.exit(0)
+
     interpreter_info = {
         "result": "success",
         "markers": markers,
@@ -550,14 +653,28 @@ def main() -> None:
         "sys_prefix": sys.prefix,
         "sys_base_executable": getattr(sys, "_base_executable", None),
         "sys_executable": sys.executable,
-        "sys_path": sys.path,
+        # We prepend the location with the interpreter discovery script copied to a
+        # temporary path to `sys.path` so we can import it, which we have to strip later
+        # to avoid having this now-deleted path around.
+        "sys_path": sys.path[1:],
+        "site_packages": site.getsitepackages(),
         "stdlib": sysconfig.get_path("stdlib"),
-        "scheme": get_scheme(),
+        # Prior to the introduction of `sysconfig` patching, python-build-standalone installations would always use
+        # "/install" as the prefix. With `sysconfig` patching, we rewrite the prefix to match the actual installation
+        # location. So in newer versions, we also write a dedicated flag to indicate standalone builds.
+        "standalone": (
+            sysconfig.get_config_var("prefix") == "/install"
+            or bool(sysconfig.get_config_var("PYTHON_BUILD_STANDALONE"))
+        ),
+        "scheme": get_scheme(use_sysconfig_scheme),
         "virtualenv": get_virtualenv(),
-        "platform": get_operating_system_and_architecture(),
+        "platform": os_and_arch,
+        "manylinux_compatible": manylinux_compatible,
         # The `t` abiflag for freethreading Python.
         # https://peps.python.org/pep-0703/#build-configuration-changes
         "gil_disabled": bool(sysconfig.get_config_var("Py_GIL_DISABLED")),
+        # https://docs.python.org/3/using/configure.html#debug-build
+        "debug_enabled": bool(sysconfig.get_config_var("Py_DEBUG")),
         # Determine if the interpreter is 32-bit or 64-bit.
         # https://github.com/python/cpython/blob/b228655c227b2ca298a8ffac44d14ce3d22f6faa/Lib/venv/__init__.py#L136
         "pointer_size": "64" if sys.maxsize > 2**32 else "32",
